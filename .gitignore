@@ -1,0 +1,12 @@
+# Create .gitignore in project root (if it doesn't exist)
+# Add these lines:
+
+.env
+env/
+__pycache__/
+*.pyc
+*.pyo
+media/
+.DS_Store
+*.sqlite3
+sessions/
