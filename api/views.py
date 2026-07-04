@@ -134,36 +134,176 @@ class ProfileView(APIView):
 
 
 class ScriptListView(APIView):
-    """
-    GET /api/scripts/
-    Returns built-in scripts + user's own uploaded scripts.
-    Optional filter: ?level=beginner  ?mode=daily
-    """
+    permission_classes = [IsAuthenticated]
+    
+    # Fallback scripts if database is empty
+    FALLBACK_SCRIPTS = [
+        {
+            'id': 1,
+            'title': 'Greeting a Friend',
+            'description': 'Simple social greeting practice',
+            'level': 'beginner',
+            'mode': 'public',
+            'content': 'Hello! How are you today? It is great to see you again. I hope you are doing well and enjoying your day.',
+            'is_builtin': True,
+            'word_count': 42,
+        },
+        {
+            'id': 2,
+            'title': 'At the Grocery Store',
+            'description': 'Shopping conversation practice',
+            'level': 'beginner',
+            'mode': 'public',
+            'content': 'Excuse me, where can I find the bread? I am looking for whole wheat bread please.',
+            'is_builtin': True,
+            'word_count': 55,
+        },
+        {
+            'id': 3,
+            'title': 'Introducing Yourself',
+            'description': 'Self-introduction practice',
+            'level': 'beginner',
+            'mode': 'public',
+            'content': 'My name is Ahmed. I am a student at the university. I enjoy reading and learning new things.',
+            'is_builtin': True,
+            'word_count': 48,
+        },
+        {
+            'id': 4,
+            'title': 'Job Interview',
+            'description': 'Professional interview scenario',
+            'level': 'intermediate',
+            'mode': 'public',
+            'content': 'Thank you for giving me this opportunity. I have five years of experience in software development and I believe my skills align well with your requirements.',
+            'is_builtin': True,
+            'word_count': 95,
+        },
+        {
+            'id': 5,
+            'title': 'Describing a Problem',
+            'description': 'Explaining workplace issues',
+            'level': 'intermediate',
+            'mode': 'public',
+            'content': 'The issue we are currently facing involves a significant delay in our supply chain. This has resulted in customer dissatisfaction and financial losses.',
+            'is_builtin': True,
+            'word_count': 88,
+        },
+        {
+            'id': 6,
+            'title': 'TED Talk Excerpt',
+            'description': 'Complex speech on technology',
+            'level': 'advanced',
+            'mode': 'public',
+            'content': 'The future of artificial intelligence is not something that will happen to us, but something we are actively shaping with every decision we make today.',
+            'is_builtin': True,
+            'word_count': 140,
+        },
+        {
+            'id': 7,
+            'title': 'Academic Presentation',
+            'description': 'Formal academic speech',
+            'level': 'advanced',
+            'mode': 'public',
+            'content': 'This research investigates the phonological patterns that distinguish native from non-native English speakers across multiple demographic variables.',
+            'is_builtin': True,
+            'word_count': 160,
+        },
+        # Daily Conversation scripts
+        {
+            'id': 8,
+            'title': 'Greeting a Friend',
+            'description': 'Casual greeting',
+            'level': 'beginner',
+            'mode': 'daily',
+            'content': 'Hello! How are you today? It is great to see you again. I hope you are doing well and enjoying your day.',
+            'is_builtin': True,
+            'word_count': 42,
+        },
+        {
+            'id': 9,
+            'title': 'At the Grocery Store',
+            'description': 'Shopping dialogue',
+            'level': 'beginner',
+            'mode': 'daily',
+            'content': 'Excuse me, where can I find the bread? I am looking for whole wheat bread please.',
+            'is_builtin': True,
+            'word_count': 55,
+        },
+        {
+            'id': 10,
+            'title': 'Introducing Yourself',
+            'description': 'Meeting new people',
+            'level': 'beginner',
+            'mode': 'daily',
+            'content': 'My name is Ahmed. I am a student at the university. I enjoy reading and learning new things.',
+            'is_builtin': True,
+            'word_count': 48,
+        },
+        {
+            'id': 11,
+            'title': 'Job Interview',
+            'description': 'Job inquiry conversation',
+            'level': 'intermediate',
+            'mode': 'daily',
+            'content': 'Thank you for giving me this opportunity. I have five years of experience in software development and I believe my skills align well with your requirements.',
+            'is_builtin': True,
+            'word_count': 95,
+        },
+        {
+            'id': 12,
+            'title': 'Describing a Problem',
+            'description': 'Discussing issues',
+            'level': 'intermediate',
+            'mode': 'daily',
+            'content': 'The issue we are currently facing involves a significant delay in our supply chain. This has resulted in customer dissatisfaction and financial losses.',
+            'is_builtin': True,
+            'word_count': 88,
+        },
+        {
+            'id': 13,
+            'title': 'Negotiation',
+            'description': 'Business negotiation',
+            'level': 'advanced',
+            'mode': 'daily',
+            'content': 'I understand your position, but I believe we can reach a mutually beneficial agreement. Let us discuss the terms that work for both parties.',
+            'is_builtin': True,
+            'word_count': 110,
+        },
+    ]
+
     def get(self, request):
         level = request.query_params.get('level')
-        mode  = request.query_params.get('mode')
+        mode = request.query_params.get('mode')
 
-        # Built-in scripts
+        # Try database first
         builtin_qs = Script.objects.filter(is_builtin=True)
         if level:
             builtin_qs = builtin_qs.filter(level=level)
         if mode:
             builtin_qs = builtin_qs.filter(mode=mode)
 
-        # User's own uploaded scripts
+        # Serialize database results
+        if builtin_qs.exists():
+            builtin = ScriptSerializer(builtin_qs, many=True).data
+        else:
+            # Fallback: use hardcoded scripts
+            builtin = self.FALLBACK_SCRIPTS
+            if level:
+                builtin = [s for s in builtin if s['level'] == level]
+            if mode:
+                builtin = [s for s in builtin if s['mode'] == mode]
+
+        # User's uploaded scripts
         user_qs = Script.objects.filter(
             is_builtin=False,
             uploaded_by=request.user
         )
-
-        builtin  = ScriptSerializer(builtin_qs, many=True).data
-        uploaded = ScriptSerializer(user_qs,    many=True).data
+        uploaded = ScriptSerializer(user_qs, many=True).data if user_qs.exists() else []
 
         return Response({
-            'builtin':  builtin,
+            'builtin': builtin,
             'uploaded': uploaded,
         })
-
 
 class ScriptUploadView(APIView):
     """
