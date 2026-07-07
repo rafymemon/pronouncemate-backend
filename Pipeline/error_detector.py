@@ -57,8 +57,9 @@ def detect_errors(alignment: list, audio, sr: int,
         # ── LAYER 1: Text-level check ──
         # G2P on what Whisper heard (text, not audio)
         from .g2p_module import build_answer_key as g2p_word
-        user_key  = g2p_word(spoken_word)
-        user_phon_text = user_key.get(spoken_word, ref_phon)
+        # Assuming the key for the text is 'word'. If Whisper gave you 'text', use ['text'] instead.
+        user_key = g2p_word(spoken_word['word'])  
+        user_phon_text = user_key.get(spoken_word['word'], ref_phon)
         user_norm_text = normalize(user_phon_text)
 
         dist_l1 = Levenshtein.distance(ref_norm, user_norm_text)
