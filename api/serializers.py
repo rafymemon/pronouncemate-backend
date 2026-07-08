@@ -32,34 +32,21 @@ class UserProfileSerializer(serializers.ModelSerializer):
 # api/serializers.py — ScriptSerializer
 
 class ScriptSerializer(serializers.ModelSerializer):
-    word_count   = serializers.SerializerMethodField()
-    preview      = serializers.SerializerMethodField()
-    uploaded_by_name = serializers.SerializerMethodField()
+    word_count = serializers.SerializerMethodField()
+    preview    = serializers.SerializerMethodField()
 
     class Meta:
         model  = Script
         fields = [
-            'id',
-            'title',
-            'description',
-            'level',
-            'mode',
-            'content',
-            'is_builtin',
-            'word_count',
-            'preview',
-            'uploaded_by_name',
-            'created_at',
+            'id', 'title', 'description',
+            'level', 'mode', 'content',
+            'is_builtin', 'word_count', 'preview',
         ]
 
     def get_word_count(self, obj):
         return len(obj.content.split())
 
     def get_preview(self, obj):
-        # First 120 characters of content for the card
-        return obj.content[:120] + '...' if len(obj.content) > 120 else obj.content
-
-    def get_uploaded_by_name(self, obj):
-        if obj.uploaded_by:
-            return obj.uploaded_by.username
-        return None
+        words = obj.content.split()
+        preview = ' '.join(words[:18])
+        return preview + '...' if len(words) > 18 else preview

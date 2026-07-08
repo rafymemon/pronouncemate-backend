@@ -129,115 +129,90 @@ class ProfileView(APIView):
         return Response(s.errors, status=400)
 
 
-
-# api/views.py — add these three views
-
-
 class ScriptListView(APIView):
     """
-    GET /api/scripts/
-    No authentication required — scripts are public.
-    Returns builtin scripts and the user's uploaded scripts.
+    GET /api/scripts/?mode=public_speaking&level=intermediate
+    Returns filtered builtin scripts + user uploads
     """
     permission_classes = [AllowAny]
 
     def get(self, request):
-        # All built-in scripts — visible to everyone
-        builtin = Script.objects.filter(is_builtin=True).order_by('level', 'title')
+        mode  = request.query_params.get('mode')
+        level = request.query_params.get('level')
 
-        # User's own uploaded scripts — only if authenticated
-        uploaded = []
+        builtin_qs = Script.objects.filter(is_builtin=True)
+        if mode:
+            builtin_qs = builtin_qs.filter(mode=mode)
+        if level:
+            builtin_qs = builtin_qs.filter(level=level)
+
+        uploaded_qs = Script.objects.none()
         if request.user and request.user.is_authenticated:
-            uploaded = Script.objects.filter(
+            uploaded_qs = Script.objects.filter(
                 is_builtin=False,
                 uploaded_by=request.user
-            ).order_by('-created_at')
-
-        # Apply optional filters
-        level = request.query_params.get('level')
-        mode  = request.query_params.get('mode')
-
-        if level and level != 'all':
-            builtin  = builtin.filter(level=level)
-            uploaded = uploaded.filter(level=level) if uploaded else uploaded
-
-        if mode and mode != 'all':
-            builtin  = builtin.filter(mode=mode)
+            )
+            if mode and mode != 'script_based':
+                uploaded_qs = uploaded_qs.filter(mode=mode)
 
         return Response({
-            'builtin':  ScriptSerializer(builtin,  many=True).data,
-            'uploaded': ScriptSerializer(uploaded, many=True).data,
-            'total':    builtin.count() + len(uploaded),
+            'builtin':  ScriptSerializer(builtin_qs,  many=True).data,
+            'uploaded': ScriptSerializer(uploaded_qs, many=True).data,
         })
-    
+
+
 class ScriptUploadView(APIView):
     """
     POST /api/scripts/upload/
-    Accepts:
-      - plain text in JSON body: {"title": "...", "content": "..."}
-      - OR a .txt / .docx file upload via multipart form
+    Accepts JSON body or multipart file (.txt / .docx)
     """
-    parser_classes = [MultiPartParser, JSONParser]
+    permission_classes = [IsAuthenticated]
+    parser_classes     = [MultiPartParser, JSONParser]
 
     def post(self, request):
         title   = request.data.get('title', '').strip()
         content = request.data.get('content', '').strip()
         level   = request.data.get('level', 'intermediate')
+        mode    = request.data.get('mode', 'script_based')
         file    = request.FILES.get('file')
 
-        # Extract text from uploaded file
         if file:
             filename = file.name.lower()
-
             if filename.endswith('.txt'):
                 content = file.read().decode('utf-8').strip()
-
             elif filename.endswith('.docx'):
-                content = self._extract_docx(file)
-
+                content = self._read_docx(file)
             else:
                 return Response(
                     {'error': 'Only .txt and .docx files are supported'},
                     status=400
                 )
-
             if not title:
-                # Use filename as title if no title provided
-                title = file.name.rsplit('.', 1)[0].replace('_', ' ').title()
+                title = file.name.rsplit('.', 1)[0]\
+                    .replace('_', ' ').replace('-', ' ').title()
 
-        # Validate
         if not content:
-            return Response({'error': 'No content found in file or request'}, status=400)
+            return Response({'error': 'No content provided'}, status=400)
         if not title:
-            return Response({'error': 'title is required'}, status=400)
+            return Response({'error': 'Title is required'}, status=400)
         if len(content.split()) < 5:
-            return Response({'error': 'Script must have at least 5 words'}, status=400)
+            return Response(
+                {'error': 'Script must have at least 5 words'}, status=400)
 
-        # Save
         script = Script.objects.create(
-            title       = title,
-            description = f"Uploaded by {request.user.username}",
-            level       = level,
-            mode        = 'custom',
-            content     = content,
-            is_builtin  = False,
-            uploaded_by = request.user,
+            title=title, level=level, mode=mode,
+            content=content, is_builtin=False,
+            uploaded_by=request.user,
+            description=f'Uploaded by {request.user.username}',
         )
         return Response(ScriptSerializer(script).data, status=201)
 
-    def _extract_docx(self, file) -> str:
-        """Extract plain text from a .docx file."""
-        try:
-            import docx
-            import tempfile, os
-            with tempfile.NamedTemporaryFile(suffix='.docx', delete=False) as tmp:
-                tmp.write(file.read())
-                tmp_path = tmp.name
-            doc  = docx.Document(tmp_path)
-            text = ' '.join(p.text for p in doc.paragraphs if p.text.strip())
-            os.unlink(tmp_path)
-            return text.strip()
-        except ImportError:
-            raise Exception("python-docx not installed. Run: pip install python-docx")
-        except Exception as e:
-            raise Exception(f"Could not read docx file: {e}")
+    def _read_docx(self, file) -> str:
+        import docx, tempfile, os
+        with tempfile.NamedTemporaryFile(suffix='.docx', delete=False) as tmp:
+            tmp.write(file.read())
+            tmp_path = tmp.name
+        doc  = docx.Document(tmp_path)
+        text = ' '.join(p.text for p in doc.paragraphs if p.text.strip())
+        os.unlink(tmp_path)
+        return text.strip()

@@ -1,41 +1,45 @@
 # api/models.py
+# api/models.py
+
 from django.db import models
 from django.contrib.auth.models import User
 
+
 class Script(models.Model):
-    """Available practice scripts (both built-in and user-uploaded)."""
+
     LEVEL_CHOICES = [
-        ('beginner',     'Beginner'),
-        ('intermediate', 'Intermediate'),
-        ('advanced',     'Advanced'),
+        ('beginner',          'Beginner'),
+        ('intermediate',      'Intermediate'),
+        ('upper_intermediate','Upper Intermediate'),
+        ('advanced',          'Advanced'),
+        ('fluent',            'Fluent'),
     ]
+
     MODE_CHOICES = [
-        ('daily',   'Daily Conversation'),
-        ('public',  'Public Speaking'),
-        ('formal',  'Formal & Professional'),
-        ('custom',  'Custom Upload'),
+        ('public_speaking',    'Public Speaking'),
+        ('daily_conversation', 'Daily Conversation'),
+        ('script_based',       'Script-Based'),
     ]
 
     title       = models.CharField(max_length=200)
-    description = models.CharField(max_length=300, blank=True)
-    level       = models.CharField(max_length=20, choices=LEVEL_CHOICES, default='beginner')
-    mode        = models.CharField(max_length=20, choices=MODE_CHOICES,  default='daily')
-    content     = models.TextField(help_text='Plain text of the script')
-    is_builtin  = models.BooleanField(default=False, help_text='True = shipped with app, False = user uploaded')
-    uploaded_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL)
+    description = models.CharField(max_length=400, blank=True)
+    level       = models.CharField(max_length=25, choices=LEVEL_CHOICES)
+    mode        = models.CharField(max_length=25, choices=MODE_CHOICES)
+    content     = models.TextField()
+    is_builtin  = models.BooleanField(default=False)
+    uploaded_by = models.ForeignKey(
+        User, null=True, blank=True, on_delete=models.SET_NULL
+    )
     created_at  = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-        ordering = ['level', 'mode', 'title']
-
-    def __str__(self):
-        # Added a fallback just in case uploaded_by is None to prevent an AttributeError crash
-        tag = 'builtin' if self.is_builtin else (self.uploaded_by.username if self.uploaded_by else 'Unknown')
-        return f"[{self.level}] {self.title} ({tag})"
+        ordering = ['level', 'title']
 
     def word_count(self):
         return len(self.content.split())
 
+    def __str__(self):
+        return f'[{self.mode}][{self.level}] {self.title}'
 
 class PracticeSession(models.Model):
     """Stores one complete practice session result per user."""
