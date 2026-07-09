@@ -1,9 +1,12 @@
 # api/urls.py — make sure these exist
+from django import views
 from django.urls import path
 from .views import (
     RegisterView, LoginView, AnalyzeView,
     SessionHistoryView, ProfileView,
     ScriptListView, ScriptUploadView,
+    dashboard_summary,
+    progress_analytics
 )
 
 urlpatterns = [
@@ -14,4 +17,6 @@ urlpatterns = [
     path('profile/',        ProfileView.as_view()),
     path('scripts/',        ScriptListView.as_view()),
     path('scripts/upload/', ScriptUploadView.as_view()),
+    path('dashboard/',      dashboard_summary, name='dashboard_summary'),
+    path('progress/analytics/', progress_analytics, name='progress_analytics'),
 ]
