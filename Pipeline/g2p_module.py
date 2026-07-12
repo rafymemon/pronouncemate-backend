@@ -1,38 +1,160 @@
-# g2p_module.py
-import nltk, re
+import nltk
+import re
+from functools import lru_cache
 from g2p_en import G2p
 
+# Download CMU dict once
 nltk.download('cmudict', quiet=True)
 cmu = nltk.corpus.cmudict.dict()  # ~134,000 words — loaded once
 g2p = G2p()                        # neural fallback for unknown words
 
+# Valid ARPAbet phoneme regex (with optional stress 0-2)
+_ARPABET_RE = re.compile(r'^[A-Z]+[0-2]?$')
+
+
+def _number_to_words(text: str) -> str:
+    """Convert digits to words before G2P. Basic implementation."""
+    import inflect
+    p = inflect.engine()
+    
+    def replace_num(match):
+        num = match.group()
+        try:
+            return p.number_to_words(int(num))
+        except (ValueError, OverflowError):
+            return num
+    
+    return re.sub(r'\b\d+\b', replace_num, text)
+
+
 def clean_word(word: str) -> str:
-    """Strip punctuation and lowercase."""
-    # Handle contractions: don't -> dont, I'm -> im
-    word = re.sub(r"'", '', word)
-    return re.sub(r"[^a-z]", '', word.lower())
+    """
+    Strip punctuation and lowercase.
+    Handles contractions carefully: preserves base word.
+    """
+    word = word.lower().strip()
+    
+    # Handle common contractions by expanding them
+    contractions = {
+        "won't": "will",
+        "can't": "can",
+        "don't": "do",
+        "didn't": "did",
+        "wouldn't": "would",
+        "couldn't": "could",
+        "shouldn't": "should",
+        "isn't": "is",
+        "aren't": "are",
+        "wasn't": "was",
+        "weren't": "were",
+        "hasn't": "has",
+        "haven't": "have",
+        "hadn't": "had",
+        "i'm": "i",
+        "you're": "you",
+        "he's": "he",
+        "she's": "she",
+        "it's": "it",
+        "we're": "we",
+        "they're": "they",
+        "i've": "i",
+        "you've": "you",
+        "we've": "we",
+        "they've": "they",
+        "i'll": "i",
+        "you'll": "you",
+        "he'll": "he",
+        "she'll": "she",
+        "it'll": "it",
+        "we'll": "we",
+        "they'll": "they",
+        "i'd": "i",
+        "you'd": "you",
+        "he'd": "he",
+        "she'd": "she",
+        "it'd": "it",
+        "we'd": "we",
+        "they'd": "they",
+        "let's": "let",
+        "that's": "that",
+        "there's": "there",
+        "what's": "what",
+        "who's": "who",
+        "where's": "where",
+        "when's": "when",
+        "why's": "why",
+        "how's": "how",
+    }
+    
+    # Check for contraction first
+    if word in contractions:
+        word = contractions[word]
+    else:
+        # Strip apostrophe and anything after for other contractions
+        word = word.split("'")[0]
+    
+    # Remove all non-alphabetic characters
+    word = re.sub(r"[^a-z]", '', word)
+    
+    return word
+
+
+@lru_cache(maxsize=10000)
+def _g2p_cached(word: str) -> list:
+    """Cached neural G2P for OOV words."""
+    phonemes = g2p(word)
+    # Validate and clean ARPAbet output
+    cleaned = []
+    for p in phonemes:
+        p = p.strip().upper()
+        if _ARPABET_RE.match(p):
+            cleaned.append(p)
+    return cleaned if cleaned else ['<UNK>']
+
 
 def build_answer_key(script_text: str) -> dict:
     """
     Returns {word: [ARPAbet phonemes]} for every word in script.
     Uses CMU Dict first (fast, exact), g2p-en neural fallback for OOV.
     """
+    # Convert numbers to words first
+    script_text = _number_to_words(script_text)
+    
     tokens = script_text.split()
     key = {}
+    
     for raw in tokens:
         word = clean_word(raw)
-        if not word or word in key:
+        if not word:
             continue
+        if word in key:
+            continue
+            
         if word in cmu:
-            phonemes = cmu[word][0]         # first pronunciation variant
+            # Use first pronunciation; could be enhanced with context-aware selection
+            phonemes = cmu[word][0]
+            # Ensure stress markers are present
+            phonemes = [p.upper() for p in phonemes]
         else:
-            phonemes = g2p(word)            # neural G2P for names, new words
-            phonemes = [p for p in phonemes if p.strip()]
+            phonemes = _g2p_cached(word)
+        
         key[word] = phonemes
+    
     return key
 
-# Example:
-# build_answer_key('The module is very important')
-# -> {'the':['DH','AH0'], 'module':['M','AA1','JH','UW0','L'],
-#     'is':['IH0','Z'], 'very':['V','EH1','R','IY0'],
-#     'important':['IH0','M','P','AO1','R','T','AH0','N','T']}
+
+def get_phonemes(word: str) -> list:
+    """Get phonemes for a single word. Returns empty list if unknown."""
+    word = clean_word(word)
+    if not word:
+        return []
+    if word in cmu:
+        return [p.upper() for p in cmu[word][0]]
+    return _g2p_cached(word)
+
+
+# Example usage
+if __name__ == "__main__":
+    test = build_answer_key("The module is very important")
+    for w, p in test.items():
+        print(f"{w}: {p}")

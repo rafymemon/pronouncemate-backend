@@ -1,7 +1,9 @@
-# audio_processor.py
-import librosa, noisereduce as nr, numpy as np
+import librosa
+import noisereduce as nr
+import numpy as np
 
 TARGET_SR = 16000  # Both Whisper and Wav2Vec2 require exactly 16kHz
+
 
 def preprocess_audio(file_path: str) -> np.ndarray:
     """
@@ -12,19 +14,26 @@ def preprocess_audio(file_path: str) -> np.ndarray:
     audio, sr = librosa.load(file_path, sr=TARGET_SR, mono=True)
 
     # Step 2: Noise reduction
-    # Use first 0.5s as noise profile (assumes user hasn't started speaking yet)
-    noise_sample = audio[:int(TARGET_SR * 0.5)]
+    noise_duration = min(0.5, len(audio) / TARGET_SR)  # Handle short audio
+    noise_samples = int(noise_duration * TARGET_SR)
+    noise_sample = audio[:noise_samples]
+    
     if np.max(np.abs(noise_sample)) > 0.01:  # only if noise sample has content
-        audio = nr.reduce_noise(
-            y=audio, sr=TARGET_SR,
-            y_noise=noise_sample,
-            prop_decrease=0.75   # 75% noise removed; >0.9 distorts consonants
-        )
+        try:
+            audio = nr.reduce_noise(
+                y=audio,
+                sr=TARGET_SR,
+                y_noise=noise_sample,
+                stationary=True,  # Use stationary for consistent noise profile
+                prop_decrease=0.75  # 75% noise removed; >0.9 distorts consonants
+            )
+        except Exception as e:
+            print(f"Warning: Noise reduction failed ({e}), using original audio")
 
     # Step 3: Trim silence from start and end
     # top_db=40: anything 40dB below peak is silence
     # Increase to 50 if mid-sentence pauses are being cut
-    audio, _ = librosa.effects.trim(audio, top_db=40)
+    audio, _ = librosa.effects.trim(audio, top_db=40, frame_length=512, hop_length=128)
 
     # Step 4: Normalize volume to peak 0.9
     peak = np.max(np.abs(audio))
@@ -32,6 +41,7 @@ def preprocess_audio(file_path: str) -> np.ndarray:
         audio = audio / peak * 0.9
 
     return audio.astype(np.float32)
+
 
 def slice_word_audio(audio: np.ndarray, start_sec: float,
                      end_sec: float, pad_ms: int = 50) -> np.ndarray:
@@ -44,8 +54,10 @@ def slice_word_audio(audio: np.ndarray, start_sec: float,
     s = max(0, int(start_sec * TARGET_SR) - pad)
     e = min(len(audio), int(end_sec * TARGET_SR) + pad)
     clip = audio[s:e]
+    
     # Pad short clips to minimum 0.15s (2400 samples)
     min_samples = int(0.15 * TARGET_SR)
     if len(clip) < min_samples:
-        clip = np.pad(clip, (0, min_samples - len(clip)))
+        clip = np.pad(clip, (0, min_samples - len(clip)), mode='constant')
+    
     return clip
