@@ -1,5 +1,5 @@
 import Levenshtein
-from typing import List, Dict, Optional
+from typing import List, Dict
 
 # Grade thresholds: (min_score, label, letter)
 GRADE_MAP = [
@@ -23,19 +23,6 @@ def calculate_score(errors: List[Dict]) -> Dict:
     """
     Session score = weighted average of per_word_score across all scored words.
     Weighting by phoneme count: longer words contribute more to the score.
-    
-    Returns dict with:
-        - score: weighted accuracy (0-100)
-        - grade: letter grade (A+, A, B, C, D)
-        - grade_label: descriptive label
-        - severity_total: sum of all severity scores
-        - severity_avg: average severity per word
-        - total_words: total words in script (excluding inserted)
-        - scored_words: words that were actually scored
-        - skipped_words: count of skipped words
-        - flagged_words: count of non-correct, non-skipped words
-        - inserted_words: count of user-inserted words
-        - breakdown: list of per-word details for UI
     """
     if not errors:
         return {
@@ -60,35 +47,31 @@ def calculate_score(errors: List[Dict]) -> Dict:
         ref_phon = e.get('ref_phon', [])
         hyp_phon = e.get('hyp_phon', [])
         severity = e.get('severity', 0)
-        
+
         phon_count = max(len(ref_phon), 1)
-        
-        # Handle different error types
+
         if err_type == 'inserted':
             inserted += 1
-            word_score = 0.0  # Inserted words hurt score
+            word_score = 0.0
         elif err_type == 'skipped':
             skipped += 1
             word_score = 0.0
         elif err_type == 'correct':
             word_score = e.get('per_word_score', 100.0)
-        elif err_type in ('substituted', 'partial'):
-            # Must have per_word_score for substituted words
+        elif err_type in ('substituted', 'partial', 'substitution', 'omission', 'insertion', 'stress'):
             word_score = e.get('per_word_score')
             if word_score is None:
-                # Compute fallback if missing
-                from .error_detector import per_word_score
-                word_score = per_word_score(ref_phon, hyp_phon)
+                from .error_detector import per_word_score_from_lists
+                word_score = per_word_score_from_lists(ref_phon, hyp_phon)
             flagged += 1
         else:
-            # Unknown type — treat as flagged
             word_score = e.get('per_word_score', 0.0)
             flagged += 1
-        
+
         weighted_sum += word_score * phon_count
         total_weight += phon_count
         severity_total += severity
-        
+
         breakdown.append({
             'word': word,
             'type': err_type,
@@ -101,7 +84,7 @@ def calculate_score(errors: List[Dict]) -> Dict:
 
     accuracy = round(weighted_sum / total_weight, 1) if total_weight > 0 else 0.0
     grade_label, grade = _get_grade(accuracy)
-    
+
     scored_words = len(errors) - inserted
     severity_avg = round(severity_total / scored_words, 2) if scored_words > 0 else 0.0
 
@@ -111,7 +94,7 @@ def calculate_score(errors: List[Dict]) -> Dict:
         'grade_label': grade_label,
         'severity_total': severity_total,
         'severity_avg': severity_avg,
-        'total_words': len(errors) - inserted,  # Script words only
+        'total_words': len(errors) - inserted,
         'scored_words': scored_words,
         'skipped_words': skipped,
         'flagged_words': flagged,

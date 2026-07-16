@@ -11,35 +11,35 @@ from .audio_processor import slice_word_audio
 # ── Severity Scale ─────────────────────────────────────────────
 SEVERITY = {
     'correct':      0,
-    'substitution': 6,   # overridden by count-based logic below
-    'omission':     7,   # overridden by count-based logic below
-    'insertion':    4,   # overridden by count-based logic below
+    'substitution': 6,
+    'omission':     7,
+    'insertion':    4,
     'skipped':      15,
     'stress':       3,
 }
 
 
 # ── Normalization ─────────────────────────────────────────────
+_ARPABET_RE = re.compile(r'^[A-Z]+[0-2]?$')
+
 def normalize(phonemes: list) -> list:
     """
     Convert ARPAbet or IPA to a comparable form.
-    Strips stress digits (ARPAbet: AE1 → ae) and IPA stress markers (ˈ, ˌ).
+    Strips stress digits (ARPAbet: AE1 -> ae) and IPA stress markers (ˈ, ˌ).
     """
     normalized = []
     for p in phonemes:
         if not p or not p.strip():
             continue
-        # Remove ARPAbet stress digits
         p = re.sub(r'[012]', '', p)
-        # Remove IPA stress markers
         p = re.sub(r'[ˈˌ]', '', p)
         normalized.append(p.lower().strip())
     return normalized
 
 
 # ── Configuration ─────────────────────────────────────────────
-L1_THRESHOLD = 0.15      # Words above this go to Layer 2
-MIN_CLIP_DURATION = 0.15  # seconds — minimum for reliable Wav2Vec2
+L1_THRESHOLD = 0.15
+MIN_CLIP_DURATION = 0.15
 
 
 # ── Main Detection ────────────────────────────────────────────
@@ -50,9 +50,6 @@ def detect_errors(alignment: list, audio: np.ndarray, sr: int = 16000,
       1. Layer 1: Text-level Levenshtein on G2P phonemes
       2. Layer 2 (if flagged): Wav2Vec2 on audio clip
       3. Classify error type from editops backtrace
-    
-    alignment: list of (spoken_info, script_word) where spoken_info is dict with
-               'word', 'start', 'end' keys, or None for skipped words.
     """
     if answer_key is None and script_text is not None:
         answer_key = build_answer_key(script_text)
@@ -63,7 +60,7 @@ def detect_errors(alignment: list, audio: np.ndarray, sr: int = 16000,
 
     for spoken_info, script_word in alignment:
 
-        # ── Skipped word (nothing spoken for this script word) ──
+        # ── Skipped word ──
         if spoken_info is None:
             results.append({
                 'word': script_word,
@@ -81,7 +78,7 @@ def detect_errors(alignment: list, audio: np.ndarray, sr: int = 16000,
         spoken_word = spoken_info.get('word', '') if isinstance(spoken_info, dict) else str(spoken_info)
         timing = spoken_info if isinstance(spoken_info, dict) else {}
 
-        # ── Inserted word (user added, not in script) ──
+        # ── Inserted word ──
         if script_word is None or script_word == '':
             results.append({
                 'word': spoken_word,
@@ -98,12 +95,10 @@ def detect_errors(alignment: list, audio: np.ndarray, sr: int = 16000,
         # ── Get reference phonemes ──
         ref_phon = answer_key.get(script_word, [])
         if not ref_phon:
-            # Fallback: compute on the fly
             ref_phon = get_phonemes(script_word)
         ref_norm = normalize(ref_phon)
 
         # ── LAYER 1: Text-level phoneme comparison ──
-        # G2P on what Whisper heard (text transcription)
         user_phon_text = get_phonemes(spoken_word) if spoken_word else ref_phon
         user_norm_text = normalize(user_phon_text)
 
@@ -111,7 +106,7 @@ def detect_errors(alignment: list, audio: np.ndarray, sr: int = 16000,
         max_len_l1 = max(len(ref_norm), len(user_norm_text), 1)
         norm_dist_l1 = dist_l1 / max_len_l1
 
-        if norm_dist_l1 < 0.001:  # Effectively identical
+        if norm_dist_l1 < 0.001:
             results.append({
                 'word': script_word,
                 'type': 'correct',
@@ -124,7 +119,6 @@ def detect_errors(alignment: list, audio: np.ndarray, sr: int = 16000,
             })
             continue
 
-        # If Layer 1 distance is below threshold, trust it (fast path)
         if norm_dist_l1 <= L1_THRESHOLD:
             error_type = classify_from_dist(norm_dist_l1)
             result = build_result(script_word, error_type, ref_phon,
@@ -132,28 +126,23 @@ def detect_errors(alignment: list, audio: np.ndarray, sr: int = 16000,
             results.append(result)
             continue
 
-        # ── LAYER 2: Acoustic check (Wav2Vec2) ──
+        # ── LAYER 2: Acoustic check ──
         start = timing.get('start', 0.0)
         end = timing.get('end', 0.0)
         clip_duration = end - start
 
-        # FIX: Guard against invalid timing
         if clip_duration < MIN_CLIP_DURATION or start >= end:
-            # Fall back to Layer 1 result
             error_type = classify_from_dist(norm_dist_l1)
             result = build_result(script_word, error_type, ref_phon,
                                   user_phon_text, norm_dist_l1)
             results.append(result)
             continue
 
-        # Slice audio and run Wav2Vec2
         clip = slice_word_audio(audio, start, end)
-        
-        # Get phonemes from audio
+
         try:
             pred_phon_ipa, avg_conf, _ = get_spoken_phonemes(clip, sr)
         except Exception as e:
-            # Wav2Vec2 failed — fall back to Layer 1
             print(f"Warning: Wav2Vec2 failed for '{script_word}': {e}")
             error_type = classify_from_dist(norm_dist_l1)
             result = build_result(script_word, error_type, ref_phon,
@@ -161,9 +150,7 @@ def detect_errors(alignment: list, audio: np.ndarray, sr: int = 16000,
             results.append(result)
             continue
 
-        # Handle empty or low-confidence predictions
         if not pred_phon_ipa or avg_conf < 0.3:
-            # Low confidence — use Layer 1 or mark as omission
             error_type = 'omission' if not pred_phon_ipa else classify_from_dist(norm_dist_l1)
             result = build_result(script_word, error_type, ref_phon,
                                   pred_phon_ipa if pred_phon_ipa else user_phon_text,
@@ -173,7 +160,6 @@ def detect_errors(alignment: list, audio: np.ndarray, sr: int = 16000,
 
         pred_norm = normalize(pred_phon_ipa)
 
-        # Compare canonical vs recognized
         dist_l2 = Levenshtein.distance(ref_norm, pred_norm)
         max_len_l2 = max(len(ref_norm), len(pred_norm), 1)
         norm_dist_l2 = dist_l2 / max_len_l2
@@ -191,7 +177,6 @@ def detect_errors(alignment: list, audio: np.ndarray, sr: int = 16000,
             })
             continue
 
-        # Classify error type from editops
         ops = Levenshtein.editops(ref_norm, pred_norm)
         error_type = classify_ops(ops, ref_norm, pred_norm)
         result = build_result(script_word, error_type, ref_phon,
@@ -201,7 +186,6 @@ def detect_errors(alignment: list, audio: np.ndarray, sr: int = 16000,
     return results
 
 
-# ── Classification ──────────────────────────────────────────
 def classify_ops(ops: list, ref: list, pred: list) -> str:
     """Determine dominant error type from Levenshtein editops."""
     if not ops:
@@ -212,28 +196,25 @@ def classify_ops(ops: list, ref: list, pred: list) -> str:
         counts[op] += 1
 
     total = len(ops)
-    
-    # If all operations are the same type, use that
+
     if counts['replace'] == total:
         return 'substitution'
     if counts['delete'] == total:
         return 'omission'
     if counts['insert'] == total:
         return 'insertion'
-    
-    # Mixed errors — determine by ratio
+
     replace_ratio = counts['replace'] / total
     delete_ratio = counts['delete'] / total
     insert_ratio = counts['insert'] / total
-    
+
     if replace_ratio >= 0.5:
         return 'substitution'
     elif delete_ratio >= 0.5:
         return 'omission'
     elif insert_ratio >= 0.5:
         return 'insertion'
-    
-    # Truly mixed — default to substitution (most common)
+
     return 'substitution'
 
 
@@ -245,14 +226,11 @@ def classify_from_dist(norm_dist: float) -> str:
         return 'substitution'
     if norm_dist <= 0.5:
         return 'omission'
-    return 'omission'  # Large distance
+    return 'omission'
 
 
-# ── Severity Assignment ───────────────────────────────────────
 def assign_severity(error_type: str, ops: list) -> int:
-    """
-    Assign severity based on error type AND number of operations.
-    """
+    """Assign severity based on error type AND number of operations."""
     if error_type == 'correct':
         return 0
     if error_type == 'skipped':
@@ -269,14 +247,11 @@ def assign_severity(error_type: str, ops: list) -> int:
     if error_type == 'insertion':
         return 4 if n == 1 else 8
 
-    return 6  # default
+    return 6
 
 
-# ── Scoring ───────────────────────────────────────────────────
 def per_word_score(error: dict) -> float:
-    """
-    Returns 0.0–100.0 for a single word from error dict.
-    """
+    """Returns 0.0-100.0 for a single word from error dict."""
     if error.get('type') == 'correct':
         return 100.0
     if error.get('type') == 'skipped':
@@ -298,10 +273,7 @@ def per_word_score(error: dict) -> float:
 
 
 def per_word_score_from_lists(ref: list, pred: list) -> float:
-    """
-    Standalone utility: score from two phoneme lists directly.
-    Used by scorer.py fallback.
-    """
+    """Standalone utility: score from two phoneme lists directly."""
     if not ref and not pred:
         return 100.0
 
@@ -317,7 +289,6 @@ def per_word_score_from_lists(ref: list, pred: list) -> float:
     return round(score, 1)
 
 
-# ── Result Builder ────────────────────────────────────────────
 def build_result(word: str, error_type: str, ref_phon: list,
                  pred_phon: list, norm_dist: float) -> dict:
     """Build the standard result dict for one word."""

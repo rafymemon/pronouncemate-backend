@@ -1,22 +1,55 @@
-# api/urls.py — make sure these exist
-from django import views
+# api/urls.py
+"""
+API URL Configuration for PronounceMate
+Includes main pronunciation + Practice Mistakes endpoints
+"""
+
 from django.urls import path
 from .views import (
-    RegisterView, LoginView, AnalyzeView,
-    SessionHistoryView, ProfileView,
-    ScriptListView, ScriptUploadView,
+    # Auth
+    RegisterView,
+    LoginView,
+    # Core
+    AnalyzeView,
+    # Practice Mistakes
+    PracticeScriptView,
+    PracticeMistakesView,
+    PracticeProgressView,
+    # History & Profile
+    SessionHistoryView,
+    ProfileView,
+    # Scripts
+    ScriptListView,
+    ScriptUploadView,
+    # Dashboard & Analytics
     dashboard_summary,
-    progress_analytics
+    progress_analytics,
 )
 
 urlpatterns = [
-    path('register/',       RegisterView.as_view()),
-    path('login/',          LoginView.as_view()),
-    path('analyze/',        AnalyzeView.as_view()),
-    path('sessions/',       SessionHistoryView.as_view()),
-    path('profile/',        ProfileView.as_view()),
-    path('scripts/',        ScriptListView.as_view()),
-    path('scripts/upload/', ScriptUploadView.as_view()),
-    path('dashboard/',      dashboard_summary, name='dashboard_summary'),
-    path('progress/analytics/', progress_analytics, name='progress_analytics'),
+    # Auth
+    path('register/', RegisterView.as_view(), name='register'),
+    path('login/', LoginView.as_view(), name='login'),
+
+    # Core Analysis
+    path('analyze/', AnalyzeView.as_view(), name='analyze'),
+
+    # Practice Mistakes
+    path('practice/script/', PracticeScriptView.as_view(), name='practice_script'),
+    path('practice/', PracticeMistakesView.as_view(), name='practice_mistakes'),
+    path('practice/progress/', PracticeProgressView.as_view(), name='practice_progress'),
+
+    # Session History
+    path('sessions/', SessionHistoryView.as_view(), name='session_history'),
+
+    # User Profile
+    path('profile/', ProfileView.as_view(), name='profile'),
+
+    # Scripts
+    path('scripts/', ScriptListView.as_view(), name='script_list'),
+    path('scripts/upload/', ScriptUploadView.as_view(), name='script_upload'),
+
+    # Dashboard & Analytics
+    path('dashboard/', dashboard_summary, name='dashboard'),
+    path('analytics/', progress_analytics, name='analytics'),
 ]

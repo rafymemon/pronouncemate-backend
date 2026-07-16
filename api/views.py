@@ -1,5 +1,5 @@
 # api/views.py
-import os, tempfile, logging
+import os, tempfile, logging, json, uuid
 from rest_framework.views      import APIView
 from rest_framework.response   import Response
 from rest_framework.parsers    import MultiPartParser, JSONParser
@@ -11,16 +11,30 @@ from .models      import PracticeSession, PhonemeError, UserProfile, Script
 from .serializers import RegisterSerializer, SessionSerializer, UserProfileSerializer, ScriptSerializer
 from Pipeline.pipeline import run_pipeline
 
+# Practice Mistakes imports
+from Pipeline.practice_mistakes import (
+    extract_mistake_words,
+    generate_practice_script,
+    run_practice_session,
+    should_offer_practice,
+    get_mistake_summary,
+    MistakeWord,
+    MIN_WORDS_FOR_PRACTICE,
+    PRACTICE_PASS_THRESHOLD,
+)
+
 from django.db.models import Avg, Count, Max, F
 from django.utils import timezone
 from datetime import timedelta
 from rest_framework.decorators import api_view, permission_classes
 
 
-
 logger = logging.getLogger(__name__)
 
-# ── Auth ────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# AUTH VIEWS
+# ═══════════════════════════════════════════════════════════════
+
 class RegisterView(APIView):
     permission_classes = [AllowAny]
     def post(self, request):
@@ -42,7 +56,10 @@ class LoginView(APIView):
             return Response({'token': token.key, 'username': user.username})
         return Response({'error': 'Invalid credentials'}, status=401)
 
-# ── Core Analysis Endpoint ───────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# CORE ANALYSIS ENDPOINT (Enhanced with Practice Mistakes)
+# ═══════════════════════════════════════════════════════════════
+
 class AnalyzeView(APIView):
     permission_classes = [IsAuthenticated]
     parser_classes     = [MultiPartParser]
@@ -51,7 +68,6 @@ class AnalyzeView(APIView):
         script_text = request.data.get('script_text', '').strip()
         audio_file  = request.FILES.get('audio')
 
-        # Validation
         if not script_text:
             return Response({'error': 'script_text is required'}, status=400)
         if not audio_file:
@@ -59,7 +75,6 @@ class AnalyzeView(APIView):
         if len(script_text.split()) < 2:
             return Response({'error': 'Script must have at least 2 words'}, status=400)
 
-        # Save audio to temp file
         ext = '.wav'
         with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
             for chunk in audio_file.chunks():
@@ -69,10 +84,16 @@ class AnalyzeView(APIView):
         try:
             logger.info(f'Analyzing for user {request.user.username}: {script_text[:50]}')
 
-            # Run the full AI pipeline
             result = run_pipeline(tmp_path, script_text)
 
-            # Save session to database
+            if not result.get('success', False):
+                return Response(result, status=400)
+
+            # Build mistake summary for Practice Mistakes button
+            errors = result.get('words', [])
+            mistake_summary = get_mistake_summary(errors)
+            result['mistake_summary'] = mistake_summary
+
             session = PracticeSession.objects.create(
                 user          = request.user,
                 script        = script_text,
@@ -80,14 +101,13 @@ class AnalyzeView(APIView):
                 accuracy      = result['score'],
                 grade         = result['grade'],
                 grade_label   = result['grade_label'],
-                severity_total= result.get('severity_total', 0),
-                total_words   = result.get('total_words', 0),
-                flagged_words = result.get('flagged_words', 0),
-                skipped_words = result.get('skipped_words', 0),
+                severity_total= result.get('stats', {}).get('severity_total', 0),
+                total_words   = result.get('stats', {}).get('total_words', 0),
+                flagged_words = result.get('stats', {}).get('flagged_words', 0),
+                skipped_words = result.get('stats', {}).get('skipped_words', 0),
                 result_json   = result
             )
 
-            # Save individual errors for analytics
             for w in result.get('words', []):
                 if w.get('type') not in ('correct', 'inserted'):
                     PhonemeError.objects.create(
@@ -97,7 +117,6 @@ class AnalyzeView(APIView):
                         severity   = w.get('severity', 0)
                     )
 
-            # Update user profile stats
             profile = request.user.userprofile
             profile.total_sessions += 1
             if result['score'] > profile.best_score:
@@ -111,18 +130,167 @@ class AnalyzeView(APIView):
             logger.exception(f'Pipeline error: {e}')
             return Response({'error': f'Analysis failed: {str(e)}'}, status=500)
 
+# PRACTICE MISTAKES ENDPOINTS (DRF APIView)
+
+class PracticeScriptView(APIView):
+    """
+    POST /api/practice/script/
+    Get generated practice script from mistake words (no audio needed).
+    """
+    permission_classes = [IsAuthenticated]
+    parser_classes = [JSONParser]
+
+    def post(self, request):
+        mistake_data = request.data.get('mistake_data', [])
+        mode = request.data.get('mode', 'sentences')
+
+        if not mistake_data:
+            return Response(
+                {'success': False, 'error': 'No mistake words provided'},
+                status=400
+            )
+
+        mistake_words = []
+        for md in mistake_data:
+            mw = MistakeWord(
+                word=md.get('word', ''),
+                error_type=md.get('error_type', ''),
+                severity=md.get('severity', 0),
+                per_word_score=md.get('per_word_score', 0.0),
+                ref_phonemes=md.get('ref_phonemes', []),
+                pred_phonemes=md.get('pred_phonemes', []),
+                explanation=md.get('explanation', ''),
+                audio_path=md.get('audio_path', None)
+            )
+            mistake_words.append(mw)
+
+        practice_script = generate_practice_script(mistake_words, mode=mode)
+
+        return Response({
+            'success': True,
+            'practice_script': practice_script,
+            'word_count': len(mistake_words),
+            'mode': mode,
+            'words': [mw.word for mw in mistake_words]
+        })
+
+
+class PracticeMistakesView(APIView):
+    """
+    POST /api/practice/
+    Submit audio for focused practice on mistake words.
+    """
+    permission_classes = [IsAuthenticated]
+    parser_classes = [MultiPartParser]
+
+    def post(self, request):
+        audio_file = request.FILES.get('audio')
+        original_session_id = request.data.get('original_session_id', '')
+        mode = request.data.get('mode', 'sentences')
+        mistake_data = request.data.get('mistake_data', [])
+
+        if not audio_file:
+            return Response(
+                {'success': False, 'error': 'No audio file provided'},
+                status=400
+            )
+
+        if not mistake_data:
+            return Response(
+                {'success': False, 'error': 'No mistake words provided'},
+                status=400
+            )
+
+        mistake_words = []
+        for md in mistake_data:
+            mw = MistakeWord(
+                word=md.get('word', ''),
+                error_type=md.get('error_type', 'unknown'),
+                severity=md.get('severity', 0),
+                per_word_score=md.get('per_word_score', 0.0),
+                ref_phonemes=md.get('ref_phonemes', []),
+                pred_phonemes=md.get('pred_phonemes', []),
+                explanation=md.get('explanation', ''),
+                audio_path=md.get('audio_path', None)
+            )
+            mistake_words.append(mw)
+
+        ext = '.wav'
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+            for chunk in audio_file.chunks():
+                tmp.write(chunk)
+            tmp_path = tmp.name
+
+        try:
+            logger.info(
+                f'Practice session for user {request.user.username}: '
+                f'{len(mistake_words)} words, mode={mode}'
+            )
+
+            result = run_practice_session(
+                raw_audio_path=tmp_path,
+                mistake_words=mistake_words,
+                original_session_id=original_session_id,
+                mode=mode
+            )
+
+            result['practice_session_id'] = uuid.uuid4().hex[:12]
+
+            return Response(result, status=200)
+
+        except Exception as e:
+            logger.exception(f'Practice session error: {e}')
+            return Response(
+                {'success': False, 'error': f'Practice failed: {str(e)}'},
+                status=500
+            )
+
         finally:
             if os.path.exists(tmp_path):
-                os.unlink(tmp_path)  # always delete temp file
+                os.unlink(tmp_path)
 
-# ── Session History ──────────────────────────────────────────────
+
+class PracticeProgressView(APIView):
+    """
+    GET /api/practice/progress/
+    Get practice progress for a specific word or all words.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        word = request.query_params.get('word')
+        user = request.user
+
+        errors_qs = PhonemeError.objects.filter(session__user=user)
+        if word:
+            errors_qs = errors_qs.filter(word=word)
+
+        error_stats = errors_qs.values('word').annotate(
+            total_errors=Count('id'),
+            avg_severity=Avg('severity'),
+            last_occurrence=Max('session__created_at')
+        ).order_by('-total_errors')
+
+        return Response({
+            'success': True,
+            'user_id': user.id,
+            'word': word,
+            'stats': list(error_stats),
+            'message': 'Practice progress retrieved'
+        })
+
+# ═══════════════════════════════════════════════════════════════
+# SESSION HISTORY & PROFILE
+# ═══════════════════════════════════════════════════════════════
+
 class SessionHistoryView(APIView):
+    permission_classes = [IsAuthenticated]
     def get(self, request):
         sessions = PracticeSession.objects.filter(user=request.user)[:20]
         return Response(SessionSerializer(sessions, many=True).data)
 
-# ── User Profile ─────────────────────────────────────────────────
 class ProfileView(APIView):
+    permission_classes = [IsAuthenticated]
     def get(self, request):
         profile, _ = UserProfile.objects.get_or_create(user=request.user)
         return Response(UserProfileSerializer(profile).data)
@@ -137,10 +305,6 @@ class ProfileView(APIView):
 
 
 class ScriptListView(APIView):
-    """
-    GET /api/scripts/?mode=public_speaking&level=intermediate
-    Returns filtered builtin scripts + user uploads
-    """
     permission_classes = [AllowAny]
 
     def get(self, request):
@@ -169,10 +333,6 @@ class ScriptListView(APIView):
 
 
 class ScriptUploadView(APIView):
-    """
-    POST /api/scripts/upload/
-    Accepts JSON body or multipart file (.txt / .docx)
-    """
     permission_classes = [IsAuthenticated]
     parser_classes     = [MultiPartParser, JSONParser]
 
@@ -195,8 +355,8 @@ class ScriptUploadView(APIView):
                     status=400
                 )
             if not title:
-                title = file.name.rsplit('.', 1)[0]\
-                    .replace('_', ' ').replace('-', ' ').title()
+                title = file.name.rsplit('.', 1)[0]
+                title = title.replace('_', ' ').replace('-', ' ').title()
 
         if not content:
             return Response({'error': 'No content provided'}, status=400)
@@ -204,7 +364,8 @@ class ScriptUploadView(APIView):
             return Response({'error': 'Title is required'}, status=400)
         if len(content.split()) < 5:
             return Response(
-                {'error': 'Script must have at least 5 words'}, status=400)
+                {'error': 'Script must have at least 5 words'}, status=400
+            )
 
         script = Script.objects.create(
             title=title, level=level, mode=mode,
@@ -224,8 +385,9 @@ class ScriptUploadView(APIView):
         os.unlink(tmp_path)
         return text.strip()
 
-    
-
+# ═══════════════════════════════════════════════════════════════
+# DASHBOARD & ANALYTICS
+# ═══════════════════════════════════════════════════════════════
 
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
@@ -234,20 +396,15 @@ def dashboard_summary(request):
     sessions = PracticeSession.objects.filter(user=user)
     all_ordered = sessions.order_by('created_at')
     
-    # ── Basic Stats ─────────────────────────────────────
     total_sessions = sessions.count()
     best_score = sessions.aggregate(max=Max('accuracy'))['max'] or 0
-    
-    # ── Streak ──────────────────────────────────────────
     streak = _calculate_streak(user)
     
-    # ── Update UserProfile cache ─────────────────────────
     profile, _ = UserProfile.objects.get_or_create(user=user)
     profile.total_sessions = total_sessions
     profile.best_score = best_score
     profile.save(update_fields=['total_sessions', 'best_score'])
     
-    # ── Recent Sessions (last 5) ────────────────────────
     recent = sessions.order_by('-created_at')[:5]
     recent_sessions = [{
         'id': s.id,
@@ -260,39 +417,25 @@ def dashboard_summary(request):
         'flagged_words': s.flagged_words,
     } for s in recent]
     
-    # ── Quick Stats ─────────────────────────────────────
     total_words = sessions.aggregate(total=Count('total_words'))['total'] or 0
     total_errors = PhonemeError.objects.filter(session__user=user).count()
-    # Estimate duration: assume ~3 seconds per word on average
     total_minutes = sum(s.total_words * 3 // 60 for s in all_ordered)
     
-    # ── Sparkline (last 7 sessions) ─────────────────────
     sparkline_sessions = list(all_ordered.values('accuracy', 'created_at')[:7])
     sparkline = [float(s['accuracy']) for s in sparkline_sessions]
     
-    # ── Improvement ─────────────────────────────────────
     improvement = _calculate_improvement(all_ordered)
     
-    # ── Focus Words (top 3) ─────────────────────────────
-    top_errors = PhonemeError.objects.filter(session__user=user) \
-        .values('word') \
-        .annotate(error_count=Count('id')) \
-        .order_by('-error_count')[:3]
+    top_errors = PhonemeError.objects.filter(session__user=user).values('word').annotate(error_count=Count('id')).order_by('-error_count')[:3]
     
     focus_words = [{
         'word': w['word'],
         'error_count': w['error_count'],
     } for w in top_errors]
     
-    # ── Score by Mode ───────────────────────────────────
-    # Since PracticeSession doesn't have mode field, infer from script content
-    # or use a simpler approach: group by session patterns
     mode_scores = _infer_mode_scores(sessions)
     
-    # ── Error Breakdown ─────────────────────────────────
-    error_types = PhonemeError.objects.filter(session__user=user) \
-        .values('error_type') \
-        .annotate(count=Count('id'))
+    error_types = PhonemeError.objects.filter(session__user=user).values('error_type').annotate(count=Count('id'))
     
     error_breakdown = {'substitution': 0, 'omission': 0, 'insertion': 0, 'skipped': 0}
     for et in error_types:
@@ -321,13 +464,74 @@ def dashboard_summary(request):
     })
 
 
-def _calculate_streak(user):
-    """Calculate consecutive days with practice sessions"""
-    from django.utils import timezone
-    from datetime import timedelta
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def progress_analytics(request):
+    user = request.user
+    sessions = PracticeSession.objects.filter(user=user).order_by('created_at')
     
-    session_dates = PracticeSession.objects.filter(user=user) \
-        .dates('created_at', 'day', order='DESC')
+    if sessions.count() < 1:
+        return Response({
+            'sessions': [],
+            'top_errors': [],
+            'error_breakdown': {'substitution': 0, 'omission': 0, 'stress': 0, 'insertion': 0},
+            'mode_scores': {},
+            'improvement': {'first_avg': 0, 'last_avg': 0, 'percentage_change': 0},
+            'total_stats': {'sessions': 0, 'words': 0, 'errors': 0, 'minutes': 0},
+        })
+    
+    session_data = [{
+        'id': s.id,
+        'accuracy': float(s.accuracy),
+        'word_count': s.total_words,
+        'duration_minutes': 0,
+        'mode': _detect_mode(s.script),
+        'created_at': s.created_at.isoformat(),
+    } for s in sessions]
+    
+    top_errors = PhonemeError.objects.filter(session__user=user).values('word').annotate(error_count=Count('id')).order_by('-error_count')[:10]
+    
+    focus_words = [{
+        'word': w['word'],
+        'error_count': w['error_count'],
+        'total_count': max(1, sessions.count()),
+    } for w in top_errors]
+    
+    error_types = PhonemeError.objects.filter(session__user=user).values('error_type').annotate(count=Count('id'))
+    
+    error_breakdown = {'substitution': 0, 'omission': 0, 'insertion': 0, 'skipped': 0}
+    for et in error_types:
+        if et['error_type'] in error_breakdown:
+            error_breakdown[et['error_type']] = et['count']
+    
+    mode_scores = _infer_mode_scores(sessions)
+    improvement = _calculate_improvement(sessions)
+    
+    total_words = sessions.aggregate(total=Count('total_words'))['total'] or 0
+    total_errors = PhonemeError.objects.filter(session__user=user).count()
+    total_minutes = sum(s.total_words * 3 // 60 for s in sessions)
+    
+    return Response({
+        'sessions': session_data,
+        'top_errors': focus_words,
+        'error_breakdown': error_breakdown,
+        'mode_scores': mode_scores,
+        'improvement': improvement,
+        'total_stats': {
+            'sessions': sessions.count(),
+            'words': total_words,
+            'errors': total_errors,
+            'minutes': total_minutes,
+        }
+    })
+
+
+# ═══════════════════════════════════════════════════════════════
+# HELPER FUNCTIONS
+# ═══════════════════════════════════════════════════════════════
+
+def _calculate_streak(user):
+    session_dates = PracticeSession.objects.filter(user=user).dates('created_at', 'day', order='DESC')
     
     if not session_dates:
         return 0
@@ -335,7 +539,6 @@ def _calculate_streak(user):
     streak = 1
     today = timezone.now().date()
     
-    # Check if practiced today or yesterday
     if session_dates[0] < today - timedelta(days=1):
         return 0
     
@@ -349,7 +552,6 @@ def _calculate_streak(user):
 
 
 def _format_date(dt):
-    """Human-readable date label"""
     now = timezone.now()
     diff = now - dt
     
@@ -365,7 +567,6 @@ def _format_date(dt):
 
 
 def _calculate_improvement(sessions_qs):
-    """Compare first 5 vs last 5 sessions"""
     sessions_list = list(sessions_qs)
     if len(sessions_list) < 2:
         return {
@@ -393,15 +594,12 @@ def _calculate_improvement(sessions_qs):
 
 
 def _detect_mode(script_text):
-    """Simple heuristic to detect practice mode from script content"""
     text_lower = script_text.lower()
     
-    # Check for speech indicators
     speech_keywords = ['ladies and gentlemen', 'thank you', 'welcome', 'honored', 'present', 'audience']
     if any(kw in text_lower for kw in speech_keywords):
         return 'public_speaking'
     
-    # Check for conversation indicators
     conv_keywords = ['hi', 'hello', 'how are you', 'nice to meet', 'chat', 'talk', 'conversation']
     if any(kw in text_lower for kw in conv_keywords):
         return 'daily_conversation'
@@ -410,94 +608,10 @@ def _detect_mode(script_text):
 
 
 def _infer_mode_scores(sessions_qs):
-    """
-    Infer mode scores from session data.
-    Since PracticeSession doesn't store mode directly, we use heuristics
-    or return overall average as fallback.
-    """
-    # For now, return overall score as all modes
-    # In production, you'd want to store mode in PracticeSession
     overall_avg = sessions_qs.aggregate(avg=Avg('accuracy'))['avg'] or 0
     
     return {
-        'public_speaking': round(float(overall_avg) * 0.95, 1),  # Slightly lower (harder)
-        'daily_conversation': round(float(overall_avg) * 1.05, 1),  # Slightly higher (easier)
+        'public_speaking': round(float(overall_avg) * 0.95, 1),
+        'daily_conversation': round(float(overall_avg) * 1.05, 1),
         'script_based': round(float(overall_avg), 1),
     }
-
-
-
-# for progress_analytics endpoint
-
-@api_view(['GET'])
-@permission_classes([IsAuthenticated])
-def progress_analytics(request):
-    user = request.user
-    sessions = PracticeSession.objects.filter(user=user).order_by('created_at')
-    
-    if sessions.count() < 1:
-        return Response({
-            'sessions': [],
-            'top_errors': [],
-            'error_breakdown': {'substitution': 0, 'omission': 0, 'stress': 0, 'insertion': 0},
-            'mode_scores': {},
-            'improvement': {'first_avg': 0, 'last_avg': 0, 'percentage_change': 0},
-            'total_stats': {'sessions': 0, 'words': 0, 'errors': 0, 'minutes': 0},
-        })
-    
-    # All session data for full trend chart
-    session_data = [{
-        'id': s.id,
-        'accuracy': float(s.accuracy),
-        'word_count': s.total_words,
-        'duration_minutes': 0,  # Add duration field if available
-        'mode': _detect_mode(s.script),
-        'created_at': s.created_at.isoformat(),
-    } for s in sessions]
-    
-    # Top 10 mispronounced words (more than dashboard's 3)
-    top_errors = PhonemeError.objects.filter(session__user=user) \
-        .values('word') \
-        .annotate(error_count=Count('id')) \
-        .order_by('-error_count')[:10]
-    
-    focus_words = [{
-        'word': w['word'],
-        'error_count': w['error_count'],
-        'total_count': max(1, sessions.count()),  # Approximate
-    } for w in top_errors]
-    
-    # Error breakdown
-    error_types = PhonemeError.objects.filter(session__user=user) \
-        .values('error_type') \
-        .annotate(count=Count('id'))
-    
-    error_breakdown = {'substitution': 0, 'omission': 0, 'insertion': 0, 'skipped': 0}
-    for et in error_types:
-        if et['error_type'] in error_breakdown:
-            error_breakdown[et['error_type']] = et['count']
-    
-    # Mode scores
-    mode_scores = _infer_mode_scores(sessions)
-    
-    # Improvement
-    improvement = _calculate_improvement(sessions)
-    
-    # Total stats
-    total_words = sessions.aggregate(total=Count('total_words'))['total'] or 0
-    total_errors = PhonemeError.objects.filter(session__user=user).count()
-    total_minutes = sum(s.total_words * 3 // 60 for s in sessions)
-    
-    return Response({
-        'sessions': session_data,
-        'top_errors': focus_words,
-        'error_breakdown': error_breakdown,
-        'mode_scores': mode_scores,
-        'improvement': improvement,
-        'total_stats': {
-            'sessions': sessions.count(),
-            'words': total_words,
-            'errors': total_errors,
-            'minutes': total_minutes,
-        }
-    })
