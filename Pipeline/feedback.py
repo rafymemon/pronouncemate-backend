@@ -218,3 +218,15 @@ def clear_audio_cache():
         except Exception as e:
             print(f"[Feedback] Failed to remove {f}: {e}")
     return len(files)
+
+
+def get_word_feedback_audio_url(word: str, lang: str = 'en') -> Optional[str]:
+    """
+    Generate TTS audio for a word and return the HTTP URL path.
+    e.g., '/media/feedback/hello_abc123.mp3'
+    """
+    local_path = get_feedback_audio(word, lang=lang)
+    if not local_path:
+        return None
+    # Convert filesystem path to URL path
+    return '/' + local_path.replace('\\', '/')

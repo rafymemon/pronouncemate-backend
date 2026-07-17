@@ -11,6 +11,9 @@ from .models      import PracticeSession, PhonemeError, UserProfile, Script
 from .serializers import RegisterSerializer, SessionSerializer, UserProfileSerializer, ScriptSerializer
 from Pipeline.pipeline import run_pipeline
 
+# NEW IMPORT — add this line
+from Pipeline.feedback import get_word_feedback_audio_url
+
 # Practice Mistakes imports
 from Pipeline.practice_mistakes import (
     extract_mistake_words,
@@ -57,7 +60,7 @@ class LoginView(APIView):
         return Response({'error': 'Invalid credentials'}, status=401)
 
 # ═══════════════════════════════════════════════════════════════
-# CORE ANALYSIS ENDPOINT (Enhanced with Practice Mistakes)
+# CORE ANALYSIS ENDPOINT (Enhanced with Practice Mistakes + Audio)
 # ═══════════════════════════════════════════════════════════════
 
 class AnalyzeView(APIView):
@@ -88,6 +91,13 @@ class AnalyzeView(APIView):
 
             if not result.get('success', False):
                 return Response(result, status=400)
+
+            # ── Generate TTS audio for every error word ─────────────
+            for word_data in result.get('words', []):
+                if word_data.get('type') not in ('correct', 'inserted'):
+                    w = word_data.get('word', '')
+                    if w:
+                        word_data['audio_path'] = get_word_feedback_audio_url(w)
 
             # Build mistake summary for Practice Mistakes button
             errors = result.get('words', [])
