@@ -90,7 +90,20 @@ class AnalyzeView(APIView):
             result = run_pipeline(tmp_path, script_text)
 
             if not result.get('success', False):
+                os.unlink(tmp_path)  # ← CHANGED: delete temp file on failure only
                 return Response(result, status=400)
+
+            # ── Save recording for playback ──────────────────────────
+            # ← ADDED: Move temp WAV to permanent media storage
+            recordings_dir = os.path.join(settings.MEDIA_ROOT, 'recordings')
+            os.makedirs(recordings_dir, exist_ok=True)
+            
+            recording_filename = f'rec_{request.user.id}_{uuid.uuid4().hex[:12]}.wav'
+            recording_path = os.path.join(recordings_dir, recording_filename)
+            os.rename(tmp_path, recording_path)  # move from temp to media
+            
+            recording_url = f'/media/recordings/{recording_filename}'
+            result['recording_url'] = recording_url  # ← ADDED: Flutter receives this
 
             # ── Generate TTS audio for every error word ─────────────
             for word_data in result.get('words', []):
@@ -138,6 +151,9 @@ class AnalyzeView(APIView):
 
         except Exception as e:
             logger.exception(f'Pipeline error: {e}')
+            # ← CHANGED: Clean up temp file on error only (success = moved to media)
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
             return Response({'error': f'Analysis failed: {str(e)}'}, status=500)
 
 # PRACTICE MISTAKES ENDPOINTS (DRF APIView)
