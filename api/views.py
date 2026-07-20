@@ -10,6 +10,13 @@ from django.conf import settings
 from .models      import PracticeSession, PhonemeError, UserProfile, Script
 from .serializers import RegisterSerializer, SessionSerializer, UserProfileSerializer, ScriptSerializer
 from Pipeline.pipeline import run_pipeline
+from django.contrib.auth.models import User
+
+from django.db.models import Avg, Count, Max, F
+from django.utils import timezone
+from datetime import timedelta
+from rest_framework.decorators import api_view, permission_classes
+
 
 # NEW IMPORT — add this line
 from Pipeline.feedback import get_word_feedback_audio_url
@@ -26,10 +33,6 @@ from Pipeline.practice_mistakes import (
     PRACTICE_PASS_THRESHOLD,
 )
 
-from django.db.models import Avg, Count, Max, F
-from django.utils import timezone
-from datetime import timedelta
-from rest_framework.decorators import api_view, permission_classes
 
 
 logger = logging.getLogger(__name__)
@@ -315,19 +318,171 @@ class SessionHistoryView(APIView):
         sessions = PracticeSession.objects.filter(user=request.user)[:20]
         return Response(SessionSerializer(sessions, many=True).data)
 
+# api/views.py — replace or add ProfileView
+
+
+
 class ProfileView(APIView):
     permission_classes = [IsAuthenticated]
+
     def get(self, request):
-        profile, _ = UserProfile.objects.get_or_create(user=request.user)
-        return Response(UserProfileSerializer(profile).data)
+        user    = request.user
+        profile = self._get_or_create_profile(user)
+
+        # ── Aggregate session stats ──────────────────────
+        sessions = PracticeSession.objects.filter(user=user)
+        total_sessions   = sessions.count()
+        scores           = [s.accuracy for s in sessions if s.accuracy is not None]
+        avg_accuracy     = round(sum(scores) / len(scores), 1) if scores else 0.0
+        best_score       = round(max(scores), 1) if scores else 0.0
+        total_words      = PhonemeError.objects.filter(
+            session__user=user).count()
+        correct_words    = PhonemeError.objects.filter(
+            session__user=user, error_type='correct').count()
+
+        # ── Auto-derive proficiency from performance ─────
+        computed_level = self._compute_level(avg_accuracy, total_sessions)
+
+        # ── Streak calculation ───────────────────────────
+        streak = self._compute_streak(user)
+
+        # ── Most practiced mode ──────────────────────────
+        from django.db.models import Count
+        mode_counts = sessions.values('script__mode').annotate(
+            count=Count('id')).order_by('-count')
+        top_mode = mode_counts.first()
+        favorite_mode = top_mode['script__mode'] if top_mode else 'None yet'
+
+        # ── Most mispronounced words (top 5) ─────────────
+        from django.db.models import Count
+        top_errors = PhonemeError.objects.filter(
+            session__user=user
+        ).exclude(
+            error_type='correct'
+        ).values('expected').annotate(
+            count=Count('id')
+        ).order_by('-count')[:5]
+
+        return Response({
+            # Identity
+            'username':    user.username,
+            'email':       user.email,
+            'first_name':  user.first_name,
+            'member_since': user.date_joined.strftime('%B %Y'),
+            'member_since_full': user.date_joined.isoformat(),
+
+            # Level
+            'proficiency_level':    profile.proficiency_level,
+            'computed_level':       computed_level,
+            'level_reason':         self._level_reason(avg_accuracy, total_sessions),
+
+            # Stats
+            'total_sessions':  total_sessions,
+            'avg_accuracy':    avg_accuracy,
+            'best_score':      best_score,
+            'total_words':     total_words,
+            'correct_words':   correct_words,
+            'streak_days':     streak,
+            'favorite_mode':   favorite_mode.replace('_', ' ').title(),
+
+            # Top errors
+            'top_errors': [
+                {'word': e['expected_word'], 'count': e['count']}
+                for e in top_errors
+            ],
+        })
 
     def patch(self, request):
-        profile, _ = UserProfile.objects.get_or_create(user=request.user)
-        s = UserProfileSerializer(profile, data=request.data, partial=True)
-        if s.is_valid():
-            s.save()
-            return Response(s.data)
-        return Response(s.errors, status=400)
+        """Update profile fields."""
+        user    = request.user
+        profile = self._get_or_create_profile(user)
+        data    = request.data
+
+        if 'first_name' in data:
+            user.first_name = data['first_name'].strip()
+            user.save(update_fields=['first_name'])
+
+        if 'proficiency_level' in data:
+            valid = ['beginner','intermediate','upper_intermediate',
+                     'advanced','fluent']
+            level = data['proficiency_level']
+            if level not in valid:
+                return Response({'error': 'Invalid level'}, status=400)
+            profile.proficiency_level = level
+            profile.save(update_fields=['proficiency_level'])
+
+        if 'email' in data:
+            email = data['email'].strip()
+            if User.objects.exclude(id=user.id).filter(email=email).exists():
+                return Response({'error': 'Email already in use'}, status=400)
+            user.email = email
+            user.save(update_fields=['email'])
+
+        return Response({'message': 'Profile updated successfully'})
+
+    def delete(self, request):
+        """Clear session history."""
+        PracticeSession.objects.filter(user=request.user).delete()
+        return Response({'message': 'Session history cleared'})
+
+    # ── Helpers ───────────────────────────────────────────
+
+    def _get_or_create_profile(self, user):
+        profile, _ = UserProfile.objects.get_or_create(
+            user=user,
+            defaults={'proficiency_level': 'beginner'}
+        )
+        return profile
+
+    def _compute_level(self, avg_accuracy: float, total_sessions: int) -> str:
+        """
+        Automatically derive level from actual performance.
+        Requires at least 3 sessions to assess reliably.
+        """
+        if total_sessions < 3:
+            return 'beginner'
+        if avg_accuracy >= 88:
+            return 'fluent'
+        if avg_accuracy >= 78:
+            return 'advanced'
+        if avg_accuracy >= 66:
+            return 'upper_intermediate'
+        if avg_accuracy >= 52:
+            return 'intermediate'
+        return 'beginner'
+
+    def _level_reason(self, avg: float, sessions: int) -> str:
+        if sessions < 3:
+            return f'Complete at least 3 sessions to unlock your computed level. ({sessions}/3 done)'
+        return f'Based on your average accuracy of {avg}% across {sessions} sessions.'
+
+    def _compute_streak(self, user) -> int:
+        from django.utils import timezone
+        from datetime import timedelta
+
+        sessions = PracticeSession.objects.filter(
+            user=user
+        ).order_by('-created_at').values_list('created_at', flat=True)
+
+        if not sessions:
+            return 0
+
+        streak   = 0
+        today    = timezone.now().date()
+        last_day = today
+
+        seen_days = sorted(
+            set(s.date() for s in sessions), reverse=True)
+
+        for day in seen_days:
+            if (last_day - day).days <= 1:
+                streak  += 1
+                last_day = day
+            else:
+                break
+
+        return streak
+
 
 
 class ScriptListView(APIView):
