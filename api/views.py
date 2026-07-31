@@ -12,7 +12,7 @@ from .serializers import RegisterSerializer, SessionSerializer, UserProfileSeria
 from Pipeline.pipeline import run_pipeline
 from django.contrib.auth.models import User
 
-from django.db.models import Avg, Count, Max, F
+from django.db.models import Avg, Count, Max, F, Sum
 from django.utils import timezone
 from datetime import timedelta
 from rest_framework.decorators import api_view, permission_classes
@@ -65,13 +65,14 @@ class LoginView(APIView):
 # ═══════════════════════════════════════════════════════════════
 # CORE ANALYSIS ENDPOINT (Enhanced with Practice Mistakes + Audio)
 # ═══════════════════════════════════════════════════════════════
-
 class AnalyzeView(APIView):
     permission_classes = [IsAuthenticated]
     parser_classes     = [MultiPartParser]
 
     def post(self, request):
+        print("🚨 FLUTTER SENT THIS DATA:", request.data)
         script_text = request.data.get('script_text', '').strip()
+        script_id   = request.data.get('script_id')  # ← ADDED: Get script_id from Flutter
         audio_file  = request.FILES.get('audio')
 
         if not script_text:
@@ -93,20 +94,19 @@ class AnalyzeView(APIView):
             result = run_pipeline(tmp_path, script_text)
 
             if not result.get('success', False):
-                os.unlink(tmp_path)  # ← CHANGED: delete temp file on failure only
+                os.unlink(tmp_path)
                 return Response(result, status=400)
 
             # ── Save recording for playback ──────────────────────────
-            # ← ADDED: Move temp WAV to permanent media storage
             recordings_dir = os.path.join(settings.MEDIA_ROOT, 'recordings')
             os.makedirs(recordings_dir, exist_ok=True)
             
             recording_filename = f'rec_{request.user.id}_{uuid.uuid4().hex[:12]}.wav'
             recording_path = os.path.join(recordings_dir, recording_filename)
-            os.rename(tmp_path, recording_path)  # move from temp to media
+            os.rename(tmp_path, recording_path)
             
             recording_url = f'/media/recordings/{recording_filename}'
-            result['recording_url'] = recording_url  # ← ADDED: Flutter receives this
+            result['recording_url'] = recording_url
 
             # ── Generate TTS audio for every error word ─────────────
             for word_data in result.get('words', []):
@@ -120,9 +120,18 @@ class AnalyzeView(APIView):
             mistake_summary = get_mistake_summary(errors)
             result['mistake_summary'] = mistake_summary
 
+            # ── FIX: Handle script_id properly ──────────────────────
+            script = None
+            if script_id:
+                try:
+                    script = Script.objects.get(id=int(script_id))
+                except (Script.DoesNotExist, ValueError):
+                    logger.warning(f'Script {script_id} not found, saving without script')
+                    script = None
+
             session = PracticeSession.objects.create(
                 user          = request.user,
-                script        = script_text,
+                script        = script,  # ← FIXED: Can be null now
                 transcript    = ' '.join(result.get('transcript', [])),
                 accuracy      = result['score'],
                 grade         = result['grade'],
@@ -154,10 +163,10 @@ class AnalyzeView(APIView):
 
         except Exception as e:
             logger.exception(f'Pipeline error: {e}')
-            # ← CHANGED: Clean up temp file on error only (success = moved to media)
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
             return Response({'error': f'Analysis failed: {str(e)}'}, status=500)
+
 
 # PRACTICE MISTAKES ENDPOINTS (DRF APIView)
 
@@ -359,7 +368,7 @@ class ProfileView(APIView):
             session__user=user
         ).exclude(
             error_type='correct'
-        ).values('expected').annotate(
+        ).values('word').annotate(
             count=Count('id')
         ).order_by('-count')[:5]
 
@@ -387,8 +396,8 @@ class ProfileView(APIView):
 
             # Top errors
             'top_errors': [
-                {'word': e['expected_word'], 'count': e['count']}
-                for e in top_errors
+            {'word': e['word'], 'count': e['count']}
+            for e in top_errors
             ],
         })
 
@@ -589,16 +598,16 @@ def dashboard_summary(request):
     recent = sessions.order_by('-created_at')[:5]
     recent_sessions = [{
         'id': s.id,
-        'title': s.script[:50] + '...' if len(s.script) > 50 else s.script,
+        'title': s.script.title[:50] + '...' if len(s.script.title) > 50 else s.script.title,
         'score': float(s.accuracy),
         'grade': s.grade,
         'date_label': _format_date(s.created_at),
-        'mode': _detect_mode(s.script),
+        'mode': _detect_mode(s.script.content),
         'total_words': s.total_words,
         'flagged_words': s.flagged_words,
     } for s in recent]
     
-    total_words = sessions.aggregate(total=Count('total_words'))['total'] or 0
+    total_words = sessions.aggregate(total=Sum('total_words'))['total'] or 0
     total_errors = PhonemeError.objects.filter(session__user=user).count()
     total_minutes = sum(s.total_words * 3 // 60 for s in all_ordered)
     
@@ -666,7 +675,7 @@ def progress_analytics(request):
         'accuracy': float(s.accuracy),
         'word_count': s.total_words,
         'duration_minutes': 0,
-        'mode': _detect_mode(s.script),
+        'mode': _detect_mode(s.script.content),
         'created_at': s.created_at.isoformat(),
     } for s in sessions]
     
@@ -688,7 +697,7 @@ def progress_analytics(request):
     mode_scores = _infer_mode_scores(sessions)
     improvement = _calculate_improvement(sessions)
     
-    total_words = sessions.aggregate(total=Count('total_words'))['total'] or 0
+    total_words = sessions.aggregate(total=Sum('total_words'))['total'] or 0
     total_errors = PhonemeError.objects.filter(session__user=user).count()
     total_minutes = sum(s.total_words * 3 // 60 for s in sessions)
     

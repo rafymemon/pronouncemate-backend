@@ -46,7 +46,12 @@ class PracticeSession(models.Model):
     user           = models.ForeignKey(User, on_delete=models.CASCADE, related_name='sessions')
     created_at     = models.DateTimeField(auto_now_add=True)
 
-    script = models.ForeignKey(Script, on_delete=models.CASCADE)
+    script = models.ForeignKey(
+        Script,
+        on_delete=models.CASCADE,
+        null=True,      # ← ADD THIS
+        blank=True,     # ← ADD THIS
+    )
     transcript     = models.TextField(blank=True, help_text='What Whisper heard')
     accuracy       = models.FloatField(help_text='0.0 to 100.0')
     grade          = models.CharField(max_length=4,  help_text='A+, A, B, C, D')
