@@ -598,11 +598,10 @@ def dashboard_summary(request):
     recent = sessions.order_by('-created_at')[:5]
     recent_sessions = [{
         'id': s.id,
-        'title': s.script.title[:50] + '...' if len(s.script.title) > 50 else s.script.title,
-        'score': float(s.accuracy),
+        'title': (s.script.title[:50] + '...') if s.script and len(s.script.title) > 50 else (s.script.title if s.script else 'Custom Script'),        'score': float(s.accuracy),
         'grade': s.grade,
         'date_label': _format_date(s.created_at),
-        'mode': _detect_mode(s.script.content),
+        'mode': _detect_mode(s.script.content) if s.script else 'script_based',
         'total_words': s.total_words,
         'flagged_words': s.flagged_words,
     } for s in recent]

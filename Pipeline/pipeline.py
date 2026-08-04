@@ -92,7 +92,7 @@ def run_pipeline(raw_audio_path: str, reference_script: str) -> dict:
         logger.error(f"Error detection failed: {e}")
         return _error_response("Error detection failed")
 
-    error_count = len([e for e in errors if e["type"] != "correct"])
+    error_count = len([e for e in errors if e["type"] not in ("correct", "inserted")])
     logger.info(f'Detected {error_count} errors out of {len(errors)} words')
 
     # ── Stage 6: Score and grade ──
@@ -103,10 +103,23 @@ def run_pipeline(raw_audio_path: str, reference_script: str) -> dict:
         return _error_response("Scoring failed")
 
     # ── Stage 7: Build feedback ──
+    # IMPORTANT: this list still includes 'inserted' entries (Flutter filters
+    # them client-side via script-word matching), but every COUNT below is
+    # computed from the same scoreable set the scorer used, so score and
+    # word-count are always consistent with each other.
     words_output, feedback = _build_feedback(errors)
 
     # ── Stage 8: Build mistake summary for Practice Mistakes feature ──
     mistake_summary = _build_mistake_summary(errors)
+
+    # ── Stage 9: Compute the exact stats Flutter's summary screen expects ──
+    # These MUST be derived from the same `errors` list the scorer consumed,
+    # never recomputed independently — that divergence was the original bug.
+    scoreable = [e for e in errors if e['type'] != 'inserted']
+    correct_count = len([e for e in scoreable if e['type'] in ('correct', 'accent')])
+    total_scoreable = len(scoreable)
+    wrong_count = total_scoreable - correct_count
+    word_accuracy = round((correct_count / total_scoreable) * 100, 1) if total_scoreable else 0.0
 
     return {
         'success': True,
@@ -120,11 +133,22 @@ def run_pipeline(raw_audio_path: str, reference_script: str) -> dict:
         'feedback': feedback,
         'mistake_summary': mistake_summary,
         'stats': {
+            # Existing fields (kept for backward compatibility with any
+            # other consumers relying on these names)
             'total_words': score_result.get('total_words', 0),
             'skipped_words': score_result.get('skipped_words', 0),
             'flagged_words': score_result.get('flagged_words', 0),
             'inserted_words': score_result.get('inserted_words', 0),
-            'audio_duration': round(audio_duration, 2)
+            'severity_total': score_result.get('severity_total', 0),
+            'audio_duration': round(audio_duration, 2),
+
+            # Fields active_session_screen.dart / session_summary_screen.dart
+            # actually read. Without these, Flutter's `?? 0` fallback masked
+            # the missing keys with a literal 0, so the summary screen always
+            # displayed "0 correct / 0 errors" regardless of real performance.
+            'correct_words': correct_count,
+            'wrong_words': wrong_count,
+            'word_accuracy': word_accuracy,
         }
     }
 
@@ -213,7 +237,7 @@ def _build_mistake_summary(errors: list) -> dict:
     mistakes = []
     for e in errors:
         err_type = e.get('type', '')
-        if err_type == 'correct' or err_type == 'inserted':
+        if err_type in ('correct', 'inserted', 'accent'):
             continue
 
         mistakes.append({
@@ -274,5 +298,15 @@ def _error_response(message: str) -> dict:
             'top_mistakes': [],
             'all_mistakes': []
         },
-        'stats': {}
+        'stats': {
+            'total_words': 0,
+            'correct_words': 0,
+            'wrong_words': 0,
+            'word_accuracy': 0.0,
+            'skipped_words': 0,
+            'flagged_words': 0,
+            'inserted_words': 0,
+            'severity_total': 0,
+            'audio_duration': 0.0,
+        }
     }
