@@ -15,19 +15,20 @@ ALLOWED_HOSTS = ['*']
 # ── Installed Apps ─────────────────────────────────────────────
 
 INSTALLED_APPS = [
+    'daphne',                     # ← ADD, must be first
     'django.contrib.admin',
     'django.contrib.auth',
     'django.contrib.contenttypes',
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
-    # Third party
+    'channels',                   # ← ADD
     'rest_framework',
     'rest_framework.authtoken',
     'corsheaders',
-    # Our apps
     'api.apps.ApiConfig',
 ]
+
 # ── Middleware ──────────────────────────────────────────────────
 MIDDLEWARE = [
     'corsheaders.middleware.CorsMiddleware',  # MUST be first
@@ -50,7 +51,7 @@ TEMPLATES = [{'BACKEND': 'django.template.backends.django.DjangoTemplates',
     'django.contrib.messages.context_processors.messages',
 ]}}]
 
-WSGI_APPLICATION = 'core.wsgi.application'
+ASGI_APPLICATION = 'core.asgi.application'
 
 # ── Database (PostgreSQL) ───────────────────────────────────────
 DATABASES = {
@@ -124,3 +125,11 @@ LOGGING = {
 
 # ── Whisper Model Selection ──────────────────────────────────────
 WHISPER_MODEL = os.getenv('WHISPER_MODEL', 'base.en')
+
+
+# ← ADD: Channels layer (in-memory, no Redis needed for dev/FYP demo)
+CHANNEL_LAYERS = {
+    'default': {
+        'BACKEND': 'channels.layers.InMemoryChannelLayer',
+    }
+}
