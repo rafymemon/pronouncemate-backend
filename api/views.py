@@ -3,6 +3,7 @@ import os, tempfile, logging, json, uuid
 from rest_framework.views      import APIView
 from rest_framework.response   import Response
 from rest_framework.parsers    import MultiPartParser, JSONParser
+from rest_framework import status
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.authtoken.models import Token
 from django.contrib.auth import authenticate
@@ -16,6 +17,9 @@ from django.db.models import Avg, Count, Max, F, Sum
 from django.utils import timezone
 from datetime import timedelta
 from rest_framework.decorators import api_view, permission_classes
+
+from .rotation import get_rotated_scripts
+from .serializers import RotatedScriptSerializer
 
 
 # NEW IMPORT — add this line
@@ -804,3 +808,42 @@ def _infer_mode_scores(sessions_qs):
         'daily_conversation': round(float(overall_avg) * 1.05, 1),
         'script_based': round(float(overall_avg), 1),
     }
+
+
+
+class ScriptRotationView(APIView):
+    """
+    GET /api/scripts/rotation/?mode=daily_conversation&level=intermediate&count=5
+
+    Returns a smart-rotated set of scripts for the logged-in user:
+    unpracticed scripts first, then the least-recently-practiced ones
+    once that pool is exhausted. mode and level are both optional —
+    omit both to rotate across the entire builtin library (used for the
+    home screen's "Today's Picks").
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        mode = request.query_params.get('mode')
+        level = request.query_params.get('level')
+
+        try:
+            count = int(request.query_params.get('count', 5))
+        except (TypeError, ValueError):
+            count = 5
+        count = max(1, min(count, 20))  # sane bounds, avoid abuse
+
+        if mode and mode not in dict(Script.MODE_CHOICES):
+            return Response(
+                {'error': f'Invalid mode "{mode}"'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if level and level not in dict(Script.LEVEL_CHOICES):
+            return Response(
+                {'error': f'Invalid level "{level}"'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        scripts = get_rotated_scripts(request.user, mode=mode, level=level, count=count)
+        serializer = RotatedScriptSerializer(scripts, many=True)
+        return Response({'scripts': serializer.data})

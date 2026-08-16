@@ -24,6 +24,8 @@ from .views import (
     # Dashboard & Analytics
     dashboard_summary,
     progress_analytics,
+    # Script Rotation
+    ScriptRotationView,
 )
 
 urlpatterns = [
@@ -52,4 +54,6 @@ urlpatterns = [
     # Dashboard & Analytics
     path('dashboard/', dashboard_summary, name='dashboard'),
     path('analytics/', progress_analytics, name='analytics'),
+
+    path('scripts/rotation/', ScriptRotationView.as_view(), name='script-rotation'),
 ]

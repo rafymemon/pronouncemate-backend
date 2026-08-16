@@ -50,3 +50,25 @@ class ScriptSerializer(serializers.ModelSerializer):
         words = obj.content.split()
         preview = ' '.join(words[:18])
         return preview + '...' if len(words) > 18 else preview
+
+
+
+
+
+class RotatedScriptSerializer(serializers.ModelSerializer):
+    word_count = serializers.SerializerMethodField()
+    preview    = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Script
+        fields = [
+            'id', 'title', 'description', 'level', 'mode',
+            'content', 'is_builtin', 'word_count', 'preview',
+        ]
+
+    def get_word_count(self, obj):
+        return obj.word_count()
+
+    def get_preview(self, obj):
+        text = obj.content
+        return text if len(text) <= 100 else text[:100] + '...'

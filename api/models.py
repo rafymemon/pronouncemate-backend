@@ -109,3 +109,28 @@ class UserProfile(models.Model):
 
     def __str__(self):
         return f'Profile: {self.user.username}'
+
+
+class UserScriptProgress(models.Model):
+    """
+    Tracks how a specific user has engaged with a specific script.
+    Powers Smart Rotation: unpracticed scripts are prioritized first;
+    once a mode/level pool is exhausted, the oldest-practiced script
+    resurfaces first (spaced-repetition-lite, no extra infra needed).
+    """
+    user              = models.ForeignKey(User, on_delete=models.CASCADE, related_name='script_progress')
+    script            = models.ForeignKey(Script, on_delete=models.CASCADE, related_name='user_progress')
+    times_practiced   = models.IntegerField(default=0)
+    last_practiced_at = models.DateTimeField(null=True, blank=True)
+    best_score        = models.FloatField(null=True, blank=True)
+    last_score        = models.FloatField(null=True, blank=True)
+    created_at        = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ('user', 'script')
+        ordering = ['-last_practiced_at']
+        verbose_name = 'User Script Progress'
+        verbose_name_plural = 'User Script Progress'
+
+    def __str__(self):
+        return f'{self.user.username} × {self.script.title} ({self.times_practiced}x)'
