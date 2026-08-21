@@ -27,6 +27,7 @@ INSTALLED_APPS = [
     'rest_framework.authtoken',
     'corsheaders',
     'api.apps.ApiConfig',
+    'Pipeline.apps.PipelineConfig',
 ]
 
 # ── Middleware ──────────────────────────────────────────────────
@@ -119,7 +120,7 @@ LOGGING = {
     'handlers': {'console': {'class': 'logging.StreamHandler'}},
     'root': {'handlers': ['console'], 'level': 'INFO'},
     'loggers': {
-        'pipeline': {'handlers': ['console'], 'level': 'INFO', 'propagate': False},
+        'Pipeline': {'handlers': ['console'], 'level': 'INFO', 'propagate': False},
     },
 }
 

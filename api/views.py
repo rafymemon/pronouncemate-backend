@@ -229,7 +229,37 @@ class PracticeMistakesView(APIView):
         audio_file = request.FILES.get('audio')
         original_session_id = request.data.get('original_session_id', '')
         mode = request.data.get('mode', 'sentences')
-        mistake_data = request.data.get('mistake_data', [])
+
+        # FIX: this endpoint uses MultiPartParser (required for the audio
+        # file), which means every non-file field — including
+        # 'mistake_data' — arrives as a plain string, not parsed JSON.
+        # Flutter's submitPractice() correctly sends it as
+        # request.fields['mistake_data'] = jsonEncode(...) since multipart
+        # fields can only be strings, so we must decode it here ourselves
+        # instead of assuming request.data.get('mistake_data', []) is
+        # already a list of dicts. Previously this silently returned the
+        # raw JSON string, and `for md in mistake_data` iterated over its
+        # individual characters, each a 1-char str, causing
+        # `md.get('word', '')` to raise AttributeError.
+        mistake_data_raw = request.data.get('mistake_data', '[]')
+        if isinstance(mistake_data_raw, str):
+            try:
+                mistake_data = json.loads(mistake_data_raw)
+            except json.JSONDecodeError:
+                return Response(
+                    {'success': False, 'error': 'mistake_data is not valid JSON'},
+                    status=400
+                )
+        else:
+            # Already a list (e.g. if parser/content-type ever changes) —
+            # handle gracefully rather than assuming one shape forever.
+            mistake_data = mistake_data_raw
+
+        if not isinstance(mistake_data, list):
+            return Response(
+                {'success': False, 'error': 'mistake_data must be a JSON array'},
+                status=400
+            )
 
         if not audio_file:
             return Response(
@@ -245,6 +275,11 @@ class PracticeMistakesView(APIView):
 
         mistake_words = []
         for md in mistake_data:
+            if not isinstance(md, dict):
+                return Response(
+                    {'success': False, 'error': 'Each mistake_data entry must be an object'},
+                    status=400
+                )
             mw = MistakeWord(
                 word=md.get('word', ''),
                 error_type=md.get('error_type', 'unknown'),
@@ -291,7 +326,7 @@ class PracticeMistakesView(APIView):
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
 
-
+                
 class PracticeProgressView(APIView):
     """
     GET /api/practice/progress/
