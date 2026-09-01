@@ -1,19 +1,18 @@
 # api/models.py
-# api/models.py
 
 from django.db import models
 from django.contrib.auth.models import User
+from django.utils import timezone
+
+
+LEVEL_CHOICES = [
+    ('beginner',     'Beginner'),
+    ('intermediate', 'Intermediate'),
+    ('expert',       'Expert'),
+]
 
 
 class Script(models.Model):
-
-    LEVEL_CHOICES = [
-        ('beginner',          'Beginner'),
-        ('intermediate',      'Intermediate'),
-        ('upper_intermediate','Upper Intermediate'),
-        ('advanced',          'Advanced'),
-        ('fluent',            'Fluent'),
-    ]
 
     MODE_CHOICES = [
         ('public_speaking',    'Public Speaking'),
@@ -23,7 +22,7 @@ class Script(models.Model):
 
     title       = models.CharField(max_length=200)
     description = models.CharField(max_length=400, blank=True)
-    level       = models.CharField(max_length=25, choices=LEVEL_CHOICES)
+    level       = models.CharField(max_length=15, choices=LEVEL_CHOICES)
     mode        = models.CharField(max_length=25, choices=MODE_CHOICES)
     content     = models.TextField()
     is_builtin  = models.BooleanField(default=False)
@@ -41,6 +40,7 @@ class Script(models.Model):
     def __str__(self):
         return f'[{self.mode}][{self.level}] {self.title}'
 
+
 class PracticeSession(models.Model):
     """Stores one complete practice session result per user."""
     user           = models.ForeignKey(User, on_delete=models.CASCADE, related_name='sessions')
@@ -49,8 +49,8 @@ class PracticeSession(models.Model):
     script = models.ForeignKey(
         Script,
         on_delete=models.CASCADE,
-        null=True,      # ← ADD THIS
-        blank=True,     # ← ADD THIS
+        null=True,
+        blank=True,
     )
     transcript     = models.TextField(blank=True, help_text='What Whisper heard')
     accuracy       = models.FloatField(help_text='0.0 to 100.0')
@@ -96,11 +96,10 @@ class PhonemeError(models.Model):
 
 class UserProfile(models.Model):
     """Extended user info for PronounceMate."""
-    LEVELS = [('beginner','Beginner'),('intermediate','Intermediate'),('advanced','Advanced')]
     ACCENTS = [('american','American English'),('british','British English')]
 
     user             = models.OneToOneField(User, on_delete=models.CASCADE)
-    proficiency_level= models.CharField(max_length=20, choices=LEVELS, default='beginner')
+    proficiency_level= models.CharField(max_length=15, choices=LEVEL_CHOICES, default='beginner')
     reference_accent = models.CharField(max_length=20, choices=ACCENTS, default='american')
     voice_feedback   = models.BooleanField(default=True)
     total_sessions   = models.IntegerField(default=0)
@@ -134,3 +133,81 @@ class UserScriptProgress(models.Model):
 
     def __str__(self):
         return f'{self.user.username} × {self.script.title} ({self.times_practiced}x)'
+
+
+
+from django.utils import timezone
+
+
+class WordMastery(models.Model):
+    """
+    Tracks an individual mispronounced word until the user demonstrates
+    consistent, retained correctness (3 consecutive correct attempts
+    across separate sessions).
+    """
+    STATUS_CHOICES = [('active', 'Active'), ('mastered', 'Mastered')]
+
+    user               = models.ForeignKey(User, on_delete=models.CASCADE, related_name='word_mastery')
+    word               = models.CharField(max_length=100)
+    error_type         = models.CharField(max_length=20, blank=True)
+    consecutive_correct= models.IntegerField(default=0)
+    status             = models.CharField(max_length=10, choices=STATUS_CHOICES, default='active')
+    last_seen_at       = models.DateTimeField(auto_now=True)
+    mastered_at        = models.DateTimeField(null=True, blank=True)
+    created_at         = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ('user', 'word')
+        ordering = ['-last_seen_at']
+
+    def __str__(self):
+        return f'{self.user.username}: {self.word} ({self.status})'
+
+
+class SessionErrorLog(models.Model):
+    """Per-word error events, feeding both progression gates and Focus Script generation."""
+    session             = models.ForeignKey(PracticeSession, on_delete=models.CASCADE, related_name='error_log_entries')
+    user                = models.ForeignKey(User, on_delete=models.CASCADE, related_name='error_logs')
+    word                = models.CharField(max_length=100)
+    error_type          = models.CharField(max_length=20)
+    mode                = models.CharField(max_length=25, blank=True)
+    level_at_time       = models.CharField(max_length=15, blank=True)
+    used_in_focus_script= models.BooleanField(default=False)
+    created_at          = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f'{self.user.username}: {self.word} ({self.error_type})'
+
+
+class LevelProgressionStatus(models.Model):
+    """Single row per user tracking global level-progression eligibility."""
+    user                 = models.OneToOneField(User, on_delete=models.CASCADE, related_name='progression_status')
+    current_level        = models.CharField(max_length=15, choices=LEVEL_CHOICES, default='beginner')
+    level_changed_at     = models.DateTimeField(default=timezone.now)
+    rolling_avg_score    = models.FloatField(default=0.0)
+    rolling_error_rate   = models.FloatField(default=0.0)
+    mastery_ratio        = models.FloatField(default=0.0)
+    flagged_phoneme_rate = models.FloatField(default=0.0)
+    eligible_for_promotion = models.BooleanField(default=False)
+    last_evaluated_at    = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f'{self.user.username}: {self.current_level} (eligible={self.eligible_for_promotion})'
+
+
+
+
+class FocusScript(models.Model):
+    """AI-generated remediation script compiled from a user's recurring error words."""
+    user             = models.ForeignKey(User, on_delete=models.CASCADE, related_name='focus_scripts')
+    generated_at     = models.DateTimeField(auto_now_add=True)
+    source_words     = models.JSONField(default=list)
+    regression_words = models.JSONField(default=list, blank=True)
+    script_text      = models.TextField()
+    completed        = models.BooleanField(default=False)
+    completed_at     = models.DateTimeField(null=True, blank=True)
+    pre_error_rate   = models.FloatField(null=True, blank=True)
+    post_error_rate  = models.FloatField(null=True, blank=True)

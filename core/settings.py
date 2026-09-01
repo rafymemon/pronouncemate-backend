@@ -134,3 +134,10 @@ CHANNEL_LAYERS = {
         'BACKEND': 'channels.layers.InMemoryChannelLayer',
     }
 }
+
+
+# GEMINI_API_KEY: os.getenv() takes the NAME of an env var to look up, not
+# the key value itself. The previous version passed the raw key string as
+# the lookup name, so this always evaluated to None. Put the real key in
+# .env as GEMINI_API_KEY=... — never here.
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', '')

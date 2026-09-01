@@ -1,14 +1,16 @@
 # api/views.py
 import os, tempfile, logging, json, uuid
+from av import data
 from rest_framework.views      import APIView
 from rest_framework.response   import Response
 from rest_framework.parsers    import MultiPartParser, JSONParser
-from rest_framework import status
+from rest_framework import request, status
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.authtoken.models import Token
 from django.contrib.auth import authenticate
 from django.conf import settings
-from .models      import PracticeSession, PhonemeError, UserProfile, Script
+from torch.profiler import profile
+from .models import PracticeSession, PhonemeError, UserProfile, Script, LEVEL_CHOICES
 from .serializers import RegisterSerializer, SessionSerializer, UserProfileSerializer, ScriptSerializer
 from Pipeline.pipeline import run_pipeline
 from django.contrib.auth.models import User
@@ -19,7 +21,19 @@ from datetime import timedelta
 from rest_framework.decorators import api_view, permission_classes
 
 from .rotation import get_rotated_scripts
+from . import gemini_service
 from .serializers import RotatedScriptSerializer
+from .progression import (
+    log_session_errors, update_word_mastery,
+    evaluate_progression, promote_if_eligible,
+    check_and_maybe_generate_focus_script,
+)
+
+from .models import WordMastery, LevelProgressionStatus, FocusScript
+from .serializers import (
+    WordMasterySerializer, LevelProgressionStatusSerializer, FocusScriptSerializer,
+)
+from .progression import evaluate_progression, promote_if_eligible
 
 
 # NEW IMPORT — add this line
@@ -162,6 +176,15 @@ class AnalyzeView(APIView):
                 profile.best_score = result['score']
             profile.save()
 
+            # ── Improvement Phase hooks ──────────────────────────────
+            try:
+                word_results = result.get('words', [])
+                log_session_errors(session, request.user, word_results)
+                update_word_mastery(request.user, word_results)
+                evaluate_progression(request.user)  # flags eligibility only — user confirms the actual level-up
+                check_and_maybe_generate_focus_script(request.user)
+            except Exception:
+                logger.exception('Improvement Phase hooks failed (non-fatal)')  
             result['session_id'] = session.id
             return Response(result, status=200)
 
@@ -451,14 +474,12 @@ class ProfileView(APIView):
             user.save(update_fields=['first_name'])
 
         if 'proficiency_level' in data:
-            valid = ['beginner','intermediate','upper_intermediate',
-                     'advanced','fluent']
+            valid = ['beginner', 'intermediate', 'expert']
             level = data['proficiency_level']
             if level not in valid:
                 return Response({'error': 'Invalid level'}, status=400)
             profile.proficiency_level = level
             profile.save(update_fields=['proficiency_level'])
-
         if 'email' in data:
             email = data['email'].strip()
             if User.objects.exclude(id=user.id).filter(email=email).exists():
@@ -489,12 +510,8 @@ class ProfileView(APIView):
         """
         if total_sessions < 3:
             return 'beginner'
-        if avg_accuracy >= 88:
-            return 'fluent'
         if avg_accuracy >= 78:
-            return 'advanced'
-        if avg_accuracy >= 66:
-            return 'upper_intermediate'
+            return 'expert'
         if avg_accuracy >= 52:
             return 'intermediate'
         return 'beginner'
@@ -614,6 +631,73 @@ class ScriptUploadView(APIView):
         os.unlink(tmp_path)
         return text.strip()
 
+
+class GenerateScriptView(APIView):
+    """
+    POST /api/scripts/generate/
+    Body: {"topic": str, "word_limit": int, "mode": str, "level": str}
+
+    Powers the "Generate with AI" button on the practice screen. Generates
+    a single custom script via Gemini from a user-supplied topic and word
+    limit, then saves it exactly like a manual upload — is_builtin=False,
+    uploaded_by=request.user — so it appears under "My Scripts" and
+    UserScriptProgress tracking works on it normally. Returns the same
+    shape as ScriptUploadView/ScriptListView.
+    """
+    permission_classes = [IsAuthenticated]
+    parser_classes = [JSONParser]
+
+    MIN_WORD_LIMIT = 20
+    MAX_WORD_LIMIT = 400
+    MAX_TOPIC_LEN = 200
+
+    def post(self, request):
+        topic = (request.data.get('topic') or '').strip()
+        mode  = request.data.get('mode')
+        level = request.data.get('level')
+
+        try:
+            word_limit = int(request.data.get('word_limit', 60))
+        except (TypeError, ValueError):
+            return Response({'error': 'word_limit must be a number'}, status=400)
+
+        if not topic:
+            return Response({'error': 'topic is required'}, status=400)
+        if len(topic) > self.MAX_TOPIC_LEN:
+            return Response(
+                {'error': f'topic must be under {self.MAX_TOPIC_LEN} characters'},
+                status=400,
+            )
+        if mode not in dict(Script.MODE_CHOICES):
+            return Response({'error': f'Invalid mode "{mode}"'}, status=400)
+        if level not in dict(LEVEL_CHOICES):
+            return Response({'error': f'Invalid level "{level}"'}, status=400)
+
+        word_limit = max(self.MIN_WORD_LIMIT, min(word_limit, self.MAX_WORD_LIMIT))
+
+        content = gemini_service.generate_custom_script(
+            topic=topic, word_limit=word_limit, level=level, mode=mode,
+        )
+
+        if not content:
+            return Response(
+                {'error': 'Script generation failed. Please try again.'},
+                status=502,
+            )
+
+        title = topic if len(topic) <= 80 else topic[:77] + '...'
+
+        script = Script.objects.create(
+            title=title,
+            description=f'AI-generated · topic: "{topic}"',
+            level=level,
+            mode=mode,
+            content=content,
+            is_builtin=False,
+            uploaded_by=request.user,
+        )
+        return Response(ScriptSerializer(script).data, status=201)
+
 # ═══════════════════════════════════════════════════════════════
 # DASHBOARD & ANALYTICS
 # ═══════════════════════════════════════════════════════════════
@@ -713,7 +797,7 @@ def progress_analytics(request):
         'accuracy': float(s.accuracy),
         'word_count': s.total_words,
         'duration_minutes': 0,
-        'mode': _detect_mode(s.script.content),
+        'mode': _detect_mode(s.script.content) if s.script else 'script_based',
         'created_at': s.created_at.isoformat(),
     } for s in sessions]
     
@@ -873,7 +957,7 @@ class ScriptRotationView(APIView):
                 {'error': f'Invalid mode "{mode}"'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        if level and level not in dict(Script.LEVEL_CHOICES):
+        if level and level not in dict(LEVEL_CHOICES):
             return Response(
                 {'error': f'Invalid level "{level}"'},
                 status=status.HTTP_400_BAD_REQUEST,
@@ -882,3 +966,149 @@ class ScriptRotationView(APIView):
         scripts = get_rotated_scripts(request.user, mode=mode, level=level, count=count)
         serializer = RotatedScriptSerializer(scripts, many=True)
         return Response({'scripts': serializer.data})
+
+
+# ═══════════════════════════════════════════════════════════════
+# IMPROVEMENT PHASE ENDPOINTS
+# ═══════════════════════════════════════════════════════════════
+
+class ProgressionStatusView(APIView):
+    """
+    GET /api/progression/
+    Returns the user's current level, rolling metrics, and per-gate
+    pass/fail breakdown for the progression transparency panel.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        status_obj, _ = evaluate_progression(request.user)
+        return Response(LevelProgressionStatusSerializer(status_obj).data)
+
+
+class WordMasteryListView(APIView):
+    """
+    GET /api/mastery/?status=active|mastered
+    Returns the user's tracked words. Defaults to active (focus) words;
+    pass ?status=mastered to see the mastered list, or omit for all.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        qs = WordMastery.objects.filter(user=request.user)
+        status_filter = request.query_params.get('status')
+        if status_filter in ('active', 'mastered'):
+            qs = qs.filter(status=status_filter)
+        return Response(WordMasterySerializer(qs, many=True).data)
+
+
+class FocusScriptListView(APIView):
+    """
+    GET /api/focus-scripts/
+    Returns the user's Focus Scripts, most recent first.
+
+    GET /api/focus-scripts/latest/
+    Returns only the most recent uncompleted one, for the dashboard
+    suggestion card — or {'focus_script': null} if there isn't one.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        qs = FocusScript.objects.filter(user=request.user)
+        return Response(FocusScriptSerializer(qs, many=True).data)
+
+
+class LatestFocusScriptView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        focus_script = FocusScript.objects.filter(
+            user=request.user, completed=False
+        ).order_by('-generated_at').first()
+
+        if not focus_script:
+            return Response({'focus_script': None})
+
+        return Response({'focus_script': FocusScriptSerializer(focus_script).data})
+
+
+class CompleteFocusScriptView(APIView):
+    """
+    PATCH /api/focus-scripts/<id>/complete/
+    Marks a Focus Script as completed and records the post-remediation
+    error rate on its target words for the pre/post comparison metric.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def patch(self, request, script_id):
+        try:
+            focus_script = FocusScript.objects.get(id=script_id, user=request.user)
+        except FocusScript.DoesNotExist:
+            return Response({'error': 'Focus Script not found'}, status=404)
+
+        post_error_rate = request.data.get('post_error_rate')
+        if post_error_rate is None:
+            return Response({'error': 'post_error_rate is required'}, status=400)
+
+        focus_script.completed = True
+        focus_script.completed_at = timezone.now()
+        focus_script.post_error_rate = float(post_error_rate)
+        focus_script.save()
+
+        return Response(FocusScriptSerializer(focus_script).data)
+
+
+
+class ConfirmPromotionView(APIView):
+    """
+    POST /api/progression/confirm/
+    Applies the level-up if the user is currently eligible. Called when
+    the user accepts the "ready to level up?" prompt shown at session start.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        new_level = promote_if_eligible(request.user)
+        if new_level:
+            return Response({'promoted': True, 'new_level': new_level})
+        return Response(
+            {'promoted': False, 'message': 'Not currently eligible for promotion'},
+            status=400,
+        )
+
+
+class FocusScriptStatsView(APIView):
+    """
+    GET /api/focus-scripts/stats/
+    Aggregate improvement stats across all completed Focus Scripts —
+    the pre/post remediation comparison metric for evaluation.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        completed = FocusScript.objects.filter(
+            user=request.user, completed=True, post_error_rate__isnull=False
+        )
+        total = completed.count()
+
+        if total == 0:
+            return Response({
+                'total_completed': 0,
+                'avg_pre_error_rate': None,
+                'avg_post_error_rate': None,
+                'avg_improvement_pct': None,
+            })
+
+        deltas = [
+            (fs.pre_error_rate or 100.0) - fs.post_error_rate
+            for fs in completed
+        ]
+        avg_pre = sum(fs.pre_error_rate or 100.0 for fs in completed) / total
+        avg_post = sum(fs.post_error_rate for fs in completed) / total
+        avg_improvement = sum(deltas) / total
+
+        return Response({
+            'total_completed': total,
+            'avg_pre_error_rate': round(avg_pre, 1),
+            'avg_post_error_rate': round(avg_post, 1),
+            'avg_improvement_pct': round(avg_improvement, 1),
+        })

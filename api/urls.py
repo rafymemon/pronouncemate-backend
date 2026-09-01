@@ -21,11 +21,20 @@ from .views import (
     # Scripts
     ScriptListView,
     ScriptUploadView,
+    GenerateScriptView,
     # Dashboard & Analytics
     dashboard_summary,
     progress_analytics,
     # Script Rotation
     ScriptRotationView,
+    # Improvement Phase
+    ProgressionStatusView,
+    ConfirmPromotionView,
+    WordMasteryListView,
+    FocusScriptListView,
+    LatestFocusScriptView,
+    CompleteFocusScriptView,
+    FocusScriptStatsView,
 )
 
 urlpatterns = [
@@ -50,10 +59,21 @@ urlpatterns = [
     # Scripts
     path('scripts/', ScriptListView.as_view(), name='script_list'),
     path('scripts/upload/', ScriptUploadView.as_view(), name='script_upload'),
+    path('scripts/generate/', GenerateScriptView.as_view(), name='script_generate'),
 
     # Dashboard & Analytics
     path('dashboard/', dashboard_summary, name='dashboard'),
     path('analytics/', progress_analytics, name='analytics'),
 
     path('scripts/rotation/', ScriptRotationView.as_view(), name='script-rotation'),
+
+    # ── Improvement Phase ────────────────────────────────
+    path('progression/', ProgressionStatusView.as_view(), name='progression-status'),
+    path('progression/confirm/', ConfirmPromotionView.as_view(), name='progression-confirm'),
+
+    path('mastery/', WordMasteryListView.as_view(), name='word-mastery-list'),
+    path('focus-scripts/latest/', LatestFocusScriptView.as_view(), name='focus-script-latest'),
+    path('focus-scripts/stats/', FocusScriptStatsView.as_view(), name='focus-script-stats'),
+    path('focus-scripts/<int:script_id>/complete/', CompleteFocusScriptView.as_view(), name='focus-script-complete'),
+    path('focus-scripts/', FocusScriptListView.as_view(), name='focus-script-list')
 ]
