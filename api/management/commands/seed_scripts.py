@@ -1,12 +1,24 @@
 """
 api/management/commands/seed_scripts.py
 
-Expanded built-in script library: 5 scripts per proficiency level,
-for both Public Speaking and Daily Conversation modes (50 total).
+Built-in script library, consolidated to 3 proficiency levels:
+beginner, intermediate, expert — 10 scripts per level, per mode
+(60 total: 30 public_speaking + 30 daily_conversation).
 
-This REPLACES the previous seed_scripts.py (which had 14 scripts with
-uneven coverage per level). Uses get_or_create on title so re-running
-this command is safe and won't create duplicates.
+Consolidation from the previous 5-level library:
+    - beginner            -> beginner   (5 originals kept + 5 new added)
+    - intermediate         -> intermediate
+    - upper_intermediate    -> intermediate (relabeled, content unchanged)
+    - advanced              -> expert       (relabeled, content unchanged)
+    - fluent                -> expert       (relabeled, content unchanged)
+
+This REPLACES the previous seed_scripts.py. Uses get_or_create on title
+so re-running this command is safe and won't create duplicates. Note:
+if you're re-seeding an existing database, the old upper_intermediate/
+advanced/fluent rows will now read "intermediate"/"expert" here, but any
+already-created rows in the DB keep whatever `level` they were created
+with — update those rows (or wipe and re-seed) if you need the level
+field itself to change on existing data.
 
 Run with:
     python manage.py seed_scripts
@@ -81,6 +93,75 @@ SCRIPTS = [
             "university. My classes usually start at nine o'clock. After "
             "class, I study in the library for two hours. In the evening, I "
             "relax and spend time with my family."
+        ),
+    },
+    {
+        "title": "My Favorite Food",
+        "description": "A simple talk describing a favorite dish and why it matters.",
+        "mode": "public_speaking",
+        "level": "beginner",
+        "content": (
+            "Today I want to talk about my favorite food, which is biryani. I "
+            "enjoy biryani because it has a wonderful mix of spices and rice. "
+            "My mother cooks it every Sunday for our family lunch. The smell "
+            "of biryani cooking always makes me feel happy and hungry. I "
+            "think food can bring people together in a special way. I hope "
+            "you all get to try a good plate of biryani someday."
+        ),
+    },
+    {
+        "title": "My Best Friend",
+        "description": "A short, warm talk introducing a close friend.",
+        "mode": "public_speaking",
+        "level": "beginner",
+        "content": (
+            "I would like to talk about my best friend, Hassan. We have known "
+            "each other since primary school. Hassan is always kind and ready "
+            "to help me when I need support. We enjoy playing football "
+            "together every weekend. A good friend makes difficult days feel "
+            "much easier. I am very grateful to have Hassan as my friend."
+        ),
+    },
+    {
+        "title": "A Visit to the Park",
+        "description": "A simple recount of a relaxing family outing.",
+        "mode": "public_speaking",
+        "level": "beginner",
+        "content": (
+            "Last weekend, I visited a park near my house with my family. The "
+            "park had many green trees and a small lake in the middle. We sat "
+            "on the grass and had a simple picnic together. My little sister "
+            "enjoyed feeding the ducks near the lake. Spending time outdoors "
+            "always makes me feel calm and refreshed. I hope to visit the "
+            "park again very soon."
+        ),
+    },
+    {
+        "title": "My Weekend Plans",
+        "description": "A short, future-tense talk about upcoming weekend activities.",
+        "mode": "public_speaking",
+        "level": "beginner",
+        "content": (
+            "Let me share my plans for this weekend. On Saturday morning, I "
+            "will clean my room and finish my homework. In the afternoon, I "
+            "plan to meet my cousins for lunch. On Sunday, I want to relax "
+            "and watch a movie at home. I also hope to call my grandmother "
+            "and ask about her health. Weekends are important because they "
+            "give me time to rest."
+        ),
+    },
+    {
+        "title": "Why I Like My City",
+        "description": "A simple, positive talk about one's hometown or city.",
+        "mode": "public_speaking",
+        "level": "beginner",
+        "content": (
+            "I want to talk about why I like living in my city. My city has "
+            "friendly people and many good places to visit. There are nice "
+            "parks, markets, and restaurants close to my home. I especially "
+            "enjoy walking around the old streets in the evening. The food "
+            "here is also very delicious and affordable. I feel proud and "
+            "comfortable calling this city my home."
         ),
     },
 
@@ -164,15 +245,11 @@ SCRIPTS = [
             "original plan."
         ),
     },
-
-    # ══════════════════════════════════════════════════════════════
-    # PUBLIC SPEAKING — UPPER INTERMEDIATE
-    # ══════════════════════════════════════════════════════════════
     {
         "title": "Balancing Studies and Social Life",
         "description": "Discussing the challenge of maintaining balance in university life.",
         "mode": "public_speaking",
-        "level": "upper_intermediate",
+        "level": "intermediate",
         "content": (
             "One of the biggest challenges university students face is finding "
             "a healthy balance between academic responsibilities and social "
@@ -189,7 +266,7 @@ SCRIPTS = [
         "title": "The Role of Youth in Nation Building",
         "description": "A speech on the responsibility of young people in national development.",
         "mode": "public_speaking",
-        "level": "upper_intermediate",
+        "level": "intermediate",
         "content": (
             "Young people carry immense responsibility when it comes to "
             "shaping the future of their nation. We are the generation that "
@@ -205,7 +282,7 @@ SCRIPTS = [
         "title": "Overcoming Fear of Public Speaking",
         "description": "Addressing a common anxiety and offering practical strategies.",
         "mode": "public_speaking",
-        "level": "upper_intermediate",
+        "level": "intermediate",
         "content": (
             "Public speaking is consistently ranked among people's greatest "
             "fears, often above the fear of death itself. This fear typically "
@@ -222,7 +299,7 @@ SCRIPTS = [
         "title": "The Impact of Social Media on Society",
         "description": "Examining both the benefits and drawbacks of social media use.",
         "mode": "public_speaking",
-        "level": "upper_intermediate",
+        "level": "intermediate",
         "content": (
             "Social media has fundamentally transformed the way society "
             "communicates, consumes information, and forms opinions. On the "
@@ -239,7 +316,7 @@ SCRIPTS = [
         "title": "Preparing for a Successful Career",
         "description": "Advice on developing skills beyond academic knowledge.",
         "mode": "public_speaking",
-        "level": "upper_intermediate",
+        "level": "intermediate",
         "content": (
             "Academic knowledge alone is no longer sufficient to guarantee a "
             "successful career in today's competitive job market. Employers "
@@ -254,13 +331,13 @@ SCRIPTS = [
     },
 
     # ══════════════════════════════════════════════════════════════
-    # PUBLIC SPEAKING — ADVANCED
+    # PUBLIC SPEAKING — EXPERT
     # ══════════════════════════════════════════════════════════════
     {
         "title": "Leadership in Challenging Times",
         "description": "Exploring qualities of effective leadership during adversity.",
         "mode": "public_speaking",
-        "level": "advanced",
+        "level": "expert",
         "content": (
             "True leadership is rarely tested during periods of stability; it "
             "reveals itself most clearly in moments of crisis and uncertainty. "
@@ -278,7 +355,7 @@ SCRIPTS = [
         "title": "The Ethics of Artificial Intelligence",
         "description": "A discussion of the moral considerations surrounding AI development.",
         "mode": "public_speaking",
-        "level": "advanced",
+        "level": "expert",
         "content": (
             "As artificial intelligence systems become increasingly embedded "
             "in critical decision-making processes, from hiring practices to "
@@ -297,7 +374,7 @@ SCRIPTS = [
         "title": "Sustainable Development and Our Responsibility",
         "description": "A speech on environmental responsibility and long-term thinking.",
         "mode": "public_speaking",
-        "level": "advanced",
+        "level": "expert",
         "content": (
             "Sustainable development requires us to fundamentally reconsider "
             "the relationship between economic growth and environmental "
@@ -316,7 +393,7 @@ SCRIPTS = [
         "title": "The Future of Higher Education",
         "description": "Examining how universities must adapt to a changing world.",
         "mode": "public_speaking",
-        "level": "advanced",
+        "level": "expert",
         "content": (
             "Higher education stands at a pivotal crossroads, challenged by "
             "the rapid pace of technological change and shifting labor market "
@@ -334,7 +411,7 @@ SCRIPTS = [
         "title": "Bridging the Gap Between Theory and Practice",
         "description": "Discussing the disconnect between academic learning and real-world application.",
         "mode": "public_speaking",
-        "level": "advanced",
+        "level": "expert",
         "content": (
             "A persistent criticism of academic institutions is the gap "
             "between theoretical knowledge and its practical application in "
@@ -349,15 +426,11 @@ SCRIPTS = [
             "their very first day in the workforce."
         ),
     },
-
-    # ══════════════════════════════════════════════════════════════
-    # PUBLIC SPEAKING — FLUENT
-    # ══════════════════════════════════════════════════════════════
     {
         "title": "The Philosophy of Innovation",
         "description": "A reflective talk on the nature and drivers of innovation.",
         "mode": "public_speaking",
-        "level": "fluent",
+        "level": "expert",
         "content": (
             "Innovation is often romanticized as a sudden flash of genius, "
             "yet a closer examination of history reveals a far more nuanced "
@@ -377,7 +450,7 @@ SCRIPTS = [
         "title": "Globalization and Cultural Identity",
         "description": "Exploring the tension between global integration and local identity.",
         "mode": "public_speaking",
-        "level": "fluent",
+        "level": "expert",
         "content": (
             "Globalization has ushered in unprecedented interconnectedness, "
             "enabling the free flow of goods, ideas, and people across "
@@ -397,7 +470,7 @@ SCRIPTS = [
         "title": "The Paradox of Choice in Modern Life",
         "description": "A talk examining how abundant options can paradoxically reduce wellbeing.",
         "mode": "public_speaking",
-        "level": "fluent",
+        "level": "expert",
         "content": (
             "Contemporary society operates under the assumption that greater "
             "choice invariably correlates with greater freedom and, by "
@@ -417,7 +490,7 @@ SCRIPTS = [
         "title": "Redefining Success in the Digital Age",
         "description": "Interrogating traditional metrics of success amid technological change.",
         "mode": "public_speaking",
-        "level": "fluent",
+        "level": "expert",
         "content": (
             "For generations, success was measured through relatively "
             "static benchmarks: stable employment, homeownership, and "
@@ -436,7 +509,7 @@ SCRIPTS = [
         "title": "The Intersection of Science and Ethics",
         "description": "A nuanced talk on the moral responsibilities accompanying scientific progress.",
         "mode": "public_speaking",
-        "level": "fluent",
+        "level": "expert",
         "content": (
             "Scientific inquiry has historically been justified by its "
             "pursuit of objective truth, ostensibly detached from moral "
@@ -519,6 +592,71 @@ SCRIPTS = [
             "clothes. What about you? I like summer because I can swim."
         ),
     },
+    {
+        "title": "Ordering Food at a Restaurant",
+        "description": "A simple dialogue for ordering a meal.",
+        "mode": "daily_conversation",
+        "level": "beginner",
+        "content": (
+            "Hello, could I please see the menu? Thank you. What do you "
+            "recommend for someone who likes spicy food? That sounds great, "
+            "I will have that dish. Could I also get a glass of water, "
+            "please? Thank you very much, I am looking forward to my meal."
+        ),
+    },
+    {
+        "title": "Talking About Pets",
+        "description": "A friendly conversation about pets and animals.",
+        "mode": "daily_conversation",
+        "level": "beginner",
+        "content": (
+            "Do you have any pets at home? Yes, I have a small dog named "
+            "Rocky. He is very playful and loves to run in the garden. What "
+            "about you, do you have any pets? I have a cat, but she prefers "
+            "sleeping most of the day. Pets really do make our homes feel "
+            "warmer."
+        ),
+    },
+    {
+        "title": "A Conversation at the Bus Stop",
+        "description": "A short, practical exchange while waiting for public transport.",
+        "mode": "daily_conversation",
+        "level": "beginner",
+        "content": (
+            "Excuse me, does this bus go to the city center? Yes, it does, "
+            "but it might take about twenty minutes. Thank you, I was not "
+            "sure if I was waiting at the right stop. No problem, the bus "
+            "should arrive very soon. Do you also take this bus every day? "
+            "Yes, I use it to go to work every morning."
+        ),
+    },
+    {
+        "title": "Making Plans for the Weekend",
+        "description": "A simple back-and-forth about weekend plans between friends.",
+        "mode": "daily_conversation",
+        "level": "beginner",
+        "content": (
+            "What are you doing this weekend? I do not have any plans yet, "
+            "why do you ask? I was thinking we could go watch a movie "
+            "together. That sounds like a good idea, what time works for "
+            "you? How about Saturday evening around seven o'clock? Perfect, "
+            "I will see you then."
+        ),
+    },
+    {
+        "title": "Talking About School Subjects",
+        "description": "A simple conversation comparing favorite and difficult school subjects.",
+        "mode": "daily_conversation",
+        "level": "beginner",
+        "content": (
+            "Which subject do you enjoy the most at school? I really like "
+            "mathematics because I enjoy solving problems. What about you, "
+            "what is your favorite subject? I prefer English because I love "
+            "reading stories. Do you find any subject difficult? I sometimes "
+            "find science a little challenging. Maybe we can study together "
+            "sometime."
+        ),
+    },
 
     # ══════════════════════════════════════════════════════════════
     # DAILY CONVERSATION — INTERMEDIATE
@@ -594,15 +732,11 @@ SCRIPTS = [
             "not improve."
         ),
     },
-
-    # ══════════════════════════════════════════════════════════════
-    # DAILY CONVERSATION — UPPER INTERMEDIATE
-    # ══════════════════════════════════════════════════════════════
     {
         "title": "Negotiating a Price at the Market",
         "description": "A back-and-forth negotiation typical of local marketplaces.",
         "mode": "daily_conversation",
-        "level": "upper_intermediate",
+        "level": "intermediate",
         "content": (
             "This looks like good quality fabric, but the price seems a bit "
             "steep for my budget. Would you be willing to lower it slightly "
@@ -617,7 +751,7 @@ SCRIPTS = [
         "title": "A Conversation About Career Goals",
         "description": "Two friends discussing their professional ambitions.",
         "mode": "daily_conversation",
-        "level": "upper_intermediate",
+        "level": "intermediate",
         "content": (
             "Have you decided what kind of career path you want to pursue "
             "after graduation? I have been considering a few different "
@@ -633,7 +767,7 @@ SCRIPTS = [
         "title": "Discussing Current Events",
         "description": "A conversation touching on recent news and its implications.",
         "mode": "daily_conversation",
-        "level": "upper_intermediate",
+        "level": "intermediate",
         "content": (
             "Did you see the news about the new policy changes announced "
             "yesterday? I think it could have a significant impact on small "
@@ -648,7 +782,7 @@ SCRIPTS = [
         "title": "Giving Advice to a Friend",
         "description": "A supportive conversation offering guidance during a difficult decision.",
         "mode": "daily_conversation",
-        "level": "upper_intermediate",
+        "level": "intermediate",
         "content": (
             "I heard you've been struggling to decide between the two job "
             "offers. Honestly, I think you should weigh not just the salary, "
@@ -663,7 +797,7 @@ SCRIPTS = [
         "title": "Talking About Cultural Differences",
         "description": "A thoughtful discussion comparing customs across cultures.",
         "mode": "daily_conversation",
-        "level": "upper_intermediate",
+        "level": "intermediate",
         "content": (
             "It's fascinating how different our cultures can be when it "
             "comes to something as simple as greeting people. In some "
@@ -676,13 +810,13 @@ SCRIPTS = [
     },
 
     # ══════════════════════════════════════════════════════════════
-    # DAILY CONVERSATION — ADVANCED
+    # DAILY CONVERSATION — EXPERT
     # ══════════════════════════════════════════════════════════════
     {
         "title": "A Job Interview Conversation",
         "description": "A realistic simulation of a professional job interview.",
         "mode": "daily_conversation",
-        "level": "advanced",
+        "level": "expert",
         "content": (
             "Thank you for taking the time to meet with me today. Could you "
             "walk me through a challenging project you worked on and how "
@@ -699,7 +833,7 @@ SCRIPTS = [
         "title": "Debating a Controversial Topic",
         "description": "A respectful but firm exchange of opposing viewpoints.",
         "mode": "daily_conversation",
-        "level": "advanced",
+        "level": "expert",
         "content": (
             "I understand your perspective, but I have to respectfully "
             "disagree with the conclusion you're drawing from that evidence. "
@@ -715,7 +849,7 @@ SCRIPTS = [
         "title": "Discussing Work-Life Balance",
         "description": "A nuanced conversation about managing professional and personal demands.",
         "mode": "daily_conversation",
-        "level": "advanced",
+        "level": "expert",
         "content": (
             "Honestly, I've been finding it increasingly difficult to "
             "maintain a healthy boundary between my work and personal life, "
@@ -731,7 +865,7 @@ SCRIPTS = [
         "title": "A Conversation About Personal Finance",
         "description": "A practical discussion on budgeting and long-term financial planning.",
         "mode": "daily_conversation",
-        "level": "advanced",
+        "level": "expert",
         "content": (
             "I've been trying to get more disciplined about saving a "
             "portion of my income every month, but it's harder than I "
@@ -746,7 +880,7 @@ SCRIPTS = [
         "title": "Resolving a Misunderstanding",
         "description": "A conversation working through a conflict between colleagues.",
         "mode": "daily_conversation",
-        "level": "advanced",
+        "level": "expert",
         "content": (
             "I think there might have been a misunderstanding about what I "
             "meant in that email, and I wanted to clarify it directly rather "
@@ -757,15 +891,11 @@ SCRIPTS = [
             "appreciate you bringing it up so we could sort it out."
         ),
     },
-
-    # ══════════════════════════════════════════════════════════════
-    # DAILY CONVERSATION — FLUENT
-    # ══════════════════════════════════════════════════════════════
     {
         "title": "A Philosophical Discussion Over Coffee",
         "description": "An informal but intellectually rich conversation between friends.",
         "mode": "daily_conversation",
-        "level": "fluent",
+        "level": "expert",
         "content": (
             "I've been thinking lately about whether we truly have as much "
             "control over our decisions as we assume, or whether most of "
@@ -782,7 +912,7 @@ SCRIPTS = [
         "title": "Discussing Climate Change Solutions",
         "description": "A thoughtful conversation weighing different approaches to climate action.",
         "mode": "daily_conversation",
-        "level": "fluent",
+        "level": "expert",
         "content": (
             "What strikes me most about the climate debate is how often the "
             "conversation gets reduced to individual responsibility, when "
@@ -798,7 +928,7 @@ SCRIPTS = [
         "title": "A Conversation About Ethics in Business",
         "description": "A nuanced dialogue on balancing profit motives with moral responsibility.",
         "mode": "daily_conversation",
-        "level": "fluent",
+        "level": "expert",
         "content": (
             "I find it genuinely difficult to reconcile the pressure "
             "companies face to maximize shareholder returns with the "
@@ -816,7 +946,7 @@ SCRIPTS = [
         "title": "Reflecting on Life Choices",
         "description": "An introspective conversation about paths taken and not taken.",
         "mode": "daily_conversation",
-        "level": "fluent",
+        "level": "expert",
         "content": (
             "Looking back, I don't think I regret the decisions I made so "
             "much as I regret the amount of anxiety I attached to making "
@@ -833,7 +963,7 @@ SCRIPTS = [
         "title": "A Debate on Technology and Privacy",
         "description": "A layered conversation weighing convenience against personal privacy.",
         "mode": "daily_conversation",
-        "level": "fluent",
+        "level": "expert",
         "content": (
             "What concerns me about the current trajectory of data "
             "collection isn't necessarily any single instance of it, but "
@@ -850,7 +980,7 @@ SCRIPTS = [
 
 
 class Command(BaseCommand):
-    help = "Seeds the database with built-in practice scripts (5 per level, per mode)."
+    help = "Seeds the database with built-in practice scripts (10 per level, per mode)."
 
     def handle(self, *args, **options):
         created_count = 0
