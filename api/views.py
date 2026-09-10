@@ -34,6 +34,7 @@ from .serializers import (
     WordMasterySerializer, LevelProgressionStatusSerializer, FocusScriptSerializer,
 )
 from .progression import evaluate_progression, promote_if_eligible
+from django.db.models.functions import TruncDate
 
 
 # NEW IMPORT — add this line
@@ -384,14 +385,31 @@ class PracticeProgressView(APIView):
 # ═══════════════════════════════════════════════════════════════
 
 class SessionHistoryView(APIView):
+    """
+    GET /api/sessions/
+    GET /api/sessions/?days=7 — restricts to the last N days. Powers the
+    Home screen's "Recent Sessions" without shipping the user's whole
+    history to filter on-device.
+    """
     permission_classes = [IsAuthenticated]
+
     def get(self, request):
-        sessions = PracticeSession.objects.filter(user=request.user)[:20]
+        sessions = PracticeSession.objects.filter(user=request.user)
+
+        days_param = request.query_params.get('days')
+        if days_param:
+            try:
+                days = max(1, int(days_param))
+                cutoff = timezone.now() - timedelta(days=days)
+                sessions = sessions.filter(created_at__gte=cutoff)
+            except (TypeError, ValueError):
+                pass  # malformed ?days= -> fall back to unfiltered, capped list
+
+        sessions = sessions.order_by('-created_at')[:50]
         return Response(SessionSerializer(sessions, many=True).data)
 
+
 # api/views.py — replace or add ProfileView
-
-
 
 class ProfileView(APIView):
     permission_classes = [IsAuthenticated]
@@ -411,11 +429,24 @@ class ProfileView(APIView):
         correct_words    = PhonemeError.objects.filter(
             session__user=user, error_type='correct').count()
 
+        # ── Vocabulary breadth: total words actually spoken across all
+        # sessions (PracticeSession.total_words), distinct from
+        # `total_words` above which counts PhonemeError rows (i.e.
+        # mispronunciations, not words practiced). Powers the Home
+        # screen's "Words Practiced" stat card; all-time, matching
+        # total_sessions/best_score/avg_accuracy/streak_days below. ──
+        words_practiced = sessions.aggregate(
+            total=Sum('total_words')
+        )['total'] or 0
+
         # ── Auto-derive proficiency from performance ─────
         computed_level = self._compute_level(avg_accuracy, total_sessions)
 
         # ── Streak calculation ───────────────────────────
         streak = self._compute_streak(user)
+
+        # ── Weekly accuracy heatmap (last 7 calendar days) ─
+        weekly_accuracy = _compute_weekly_accuracy(user)
 
         # ── Most practiced mode ──────────────────────────
         from django.db.models import Count
@@ -453,8 +484,10 @@ class ProfileView(APIView):
             'best_score':      best_score,
             'total_words':     total_words,
             'correct_words':   correct_words,
+            'words_practiced': words_practiced,
             'streak_days':     streak,
             'favorite_mode':   favorite_mode.replace('_', ' ').title(),
+            'weekly_accuracy': weekly_accuracy,
 
             # Top errors
             'top_errors': [
@@ -863,6 +896,42 @@ def _calculate_streak(user):
     return streak
 
 
+
+
+
+def _compute_weekly_accuracy(user, days=7):
+    """
+    Returns `days` entries (oldest -> newest, ending today), each with that
+    CALENDAR DAY's average PracticeSession accuracy and session count —
+    grouped via TruncDate + Avg, not just the last N raw session scores.
+    This is the source of truth for the Home screen's Weekly Activity
+    heatmap; computed fresh on every call so a session completed seconds
+    ago is already reflected.
+    """
+    today = timezone.now().date()
+    start_date = today - timedelta(days=days - 1)
+
+    rows = (
+        PracticeSession.objects
+        .filter(user=user, created_at__date__gte=start_date)
+        .annotate(day=TruncDate('created_at'))
+        .values('day')
+        .annotate(avg_accuracy=Avg('accuracy'), session_count=Count('id'))
+    )
+    by_day = {row['day']: row for row in rows}
+
+    result = []
+    for i in range(days):
+        day = start_date + timedelta(days=i)
+        row = by_day.get(day)
+        result.append({
+            'date': day.isoformat(),
+            'average_accuracy': round(float(row['avg_accuracy']), 1) if row else 0.0,
+            'session_count': row['session_count'] if row else 0,
+        })
+    return result
+
+
 def _format_date(dt):
     now = timezone.now()
     diff = now - dt
@@ -1112,3 +1181,6 @@ class FocusScriptStatsView(APIView):
             'avg_post_error_rate': round(avg_post, 1),
             'avg_improvement_pct': round(avg_improvement, 1),
         })
+
+
+

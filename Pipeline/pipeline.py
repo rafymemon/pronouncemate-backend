@@ -3,11 +3,12 @@ from typing import List, Dict
 import uuid
 from .audio_processor import preprocess_audio, slice_word_audio
 from .whisper_asr import transcribe
-from .g2p_module import build_answer_key
+from .g2p_module import build_answer_key, build_script_word_list
 from .alignment import needleman_wunsch
 from .error_detector import detect_errors
 from .scorer import calculate_score
 from .feedback import generate_explanation, get_feedback_audio
+from .phoneme_display import to_display_ipa
 
 logger = logging.getLogger(__name__)
 
@@ -69,9 +70,9 @@ def run_pipeline(raw_audio_path: str, reference_script: str) -> dict:
         return _error_response("Reference script is empty or invalid")
 
     # ── Stage 4: Align spoken words to script words ──
+    # ── Stage 4: Align spoken words to script words ──
     spoken_words = [w['word'] for w in transcript]
-    script_words = list(answer_key.keys())
-
+    script_words = build_script_word_list(reference_script)   # ← was list(answer_key.keys())
     try:
         alignment = needleman_wunsch(spoken_words, script_words)
     except Exception as e:
@@ -194,13 +195,18 @@ def _build_feedback(errors: list) -> tuple:
     feedback = []
 
     for e in errors:
+        # Display-only conversion — scoring already happened upstream
+        # using whichever alphabet (ARPAbet or IPA) each path produced.
+        ref_display = to_display_ipa(e.get('ref_phon', []))
+        pred_display = to_display_ipa(e.get('pred_phon', []))
+
         word_entry = {
             'word': e['word'],
             'type': e['type'],
             'per_word_score': e.get('per_word_score', 100.0),
             'severity': e.get('severity', 0),
-            'ref_phonemes': e.get('ref_phon', []),
-            'pred_phonemes': e.get('pred_phon', []),
+            'ref_phonemes': ref_display,
+            'pred_phonemes': pred_display,
             'explanation': None,
             'audio_path': None
         }
@@ -219,8 +225,8 @@ def _build_feedback(errors: list) -> tuple:
                     'severity': e.get('severity', 0),
                     'explanation': explanation,
                     'audio_path': audio_path,
-                    'ref_phonemes': e.get('ref_phon', []),
-                    'pred_phonemes': e.get('pred_phon', [])
+                    'ref_phonemes': ref_display,
+                    'pred_phonemes': pred_display
                 })
             except Exception as ex:
                 logger.warning(f"Feedback generation failed for '{e['word']}': {ex}")

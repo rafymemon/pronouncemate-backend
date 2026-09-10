@@ -142,6 +142,23 @@ def build_answer_key(script_text: str) -> dict:
     
     return key
 
+def build_script_word_list(script_text: str) -> list:
+    """
+    Returns the ordered list of cleaned words in the script, WITH
+    duplicates preserved (unlike build_answer_key's dict keys, which
+    dedupe). This is what must be passed to the aligner — the aligner
+    needs the actual word sequence, not a unique-word set.
+    """
+    script_text = _number_to_words(script_text)
+    tokens = script_text.split()
+    words = []
+    for raw in tokens:
+        word = clean_word(raw)
+        if not word:
+            continue
+        words.append(word)
+    return words
+
 
 def get_phonemes(word: str) -> list:
     """Get phonemes for a single word. Returns empty list if unknown."""

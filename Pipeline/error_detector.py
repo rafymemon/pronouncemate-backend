@@ -4,7 +4,7 @@ import numpy as np
 from typing import List, Dict, Tuple, Optional
 
 from .g2p_module import get_phonemes, build_answer_key
-from .wav2vec_phonemes import recognize_phonemes, get_spoken_phonemes
+from .wav2vec_phonemes import recognize_phonemes, get_spoken_phonemes, text_to_phonemes
 from .audio_processor import slice_word_audio
 
 
@@ -47,9 +47,27 @@ def detect_errors(alignment: list, audio: np.ndarray, sr: int = 16000,
                   answer_key: dict = None, script_text: str = None) -> list:
     """
     For each aligned (spoken_word_info, script_word) pair:
-      1. Layer 1: Text-level Levenshtein on G2P phonemes
-      2. Layer 2 (if flagged): Wav2Vec2 on audio clip
-      3. Classify error type from editops backtrace
+      1. Try the ACOUSTIC check first (Wav2Vec2 on the audio clip) —
+         this is the real pronunciation verification, since it's derived
+         from what was actually spoken rather than Whisper's ASR text,
+         which tends to auto-correct mispronounced-but-recognizable words
+         back to the intended dictionary spelling.
+      2. Fall back to the text-level G2P/CMU comparison only when the
+         audio clip is unusable (too short, bad timestamps, or the
+         Wav2Vec2 call fails / returns low confidence).
+      3. Classify error type from editops backtrace.
+
+    IMPORTANT — phoneme alphabets are NOT interchangeable:
+      - answer_key (from g2p_module/CMU dict) is ARPAbet.
+      - Wav2Vec2 (facebook/wav2vec2-lv-60-espeak-cv-ft) outputs
+        espeak/IPA phonemes.
+      Comparing ARPAbet against IPA directly (e.g. 'hh' vs 'h', 'ow' vs
+      'oʊ') is meaningless — they almost never match even for correct
+      pronunciation. So the acoustic branch below builds its OWN IPA
+      reference via text_to_phonemes() (espeak), completely separate
+      from answer_key. The text-fallback branch keeps using
+      answer_key/CMU (ARPAbet-vs-ARPAbet, internally consistent) since
+      it never touches Wav2Vec2 output.
     """
     if answer_key is None and script_text is not None:
         answer_key = build_answer_key(script_text)
@@ -92,13 +110,69 @@ def detect_errors(alignment: list, audio: np.ndarray, sr: int = 16000,
             })
             continue
 
-        # ── Get reference phonemes ──
+        # ── Get ARPAbet reference phonemes (used only by text-fallback) ──
         ref_phon = answer_key.get(script_word, [])
         if not ref_phon:
             ref_phon = get_phonemes(script_word)
         ref_norm = normalize(ref_phon)
 
-        # ── LAYER 1: Text-level phoneme comparison ──
+        # ── Try ACOUSTIC check first ──
+        start = timing.get('start', 0.0)
+        end = timing.get('end', 0.0)
+        clip_duration = end - start
+        clip_usable = clip_duration >= MIN_CLIP_DURATION and start < end
+
+        acoustic_result = None
+        if clip_usable:
+            # IPA reference for THIS branch only — never mix with the
+            # ARPAbet ref_phon/ref_norm computed above.
+            ref_phon_ipa = text_to_phonemes(script_word)
+            ref_norm_ipa = normalize(ref_phon_ipa)
+
+            clip = slice_word_audio(audio, start, end)
+            try:
+                pred_phon_ipa, avg_conf, _ = get_spoken_phonemes(clip, sr)
+            except Exception as e:
+                print(f"Warning: Wav2Vec2 failed for '{script_word}': {e}")
+                pred_phon_ipa, avg_conf = None, 0.0
+
+            if pred_phon_ipa and avg_conf >= 0.3:
+                pred_norm = normalize(pred_phon_ipa)
+                dist_l2 = Levenshtein.distance(ref_norm_ipa, pred_norm)
+                max_len_l2 = max(len(ref_norm_ipa), len(pred_norm), 1)
+                norm_dist_l2 = dist_l2 / max_len_l2
+
+                if norm_dist_l2 < 0.001:
+                    acoustic_result = {
+                        'word': script_word,
+                        'type': 'correct',
+                        'severity': 0,
+                        'ref_phon': ref_phon_ipa,
+                        'pred_phon': pred_phon_ipa,
+                        'ref_phon_norm': ref_norm_ipa,
+                        'pred_phon_norm': pred_norm,
+                        'per_word_score': 100.0
+                    }
+                else:
+                    ops = Levenshtein.editops(ref_norm_ipa, pred_norm)
+                    error_type = classify_ops(ops, ref_norm_ipa, pred_norm)
+                    acoustic_result = build_result(script_word, error_type, ref_phon_ipa,
+                                                    pred_phon_ipa, norm_dist_l2)
+            elif pred_phon_ipa == [] or pred_phon_ipa is None:
+                # Wav2Vec2 ran but detected no usable phonemes in the clip
+                acoustic_result = build_result(script_word, 'omission', ref_phon_ipa,
+                                                [], 1.0)
+            # else: low confidence but non-empty prediction — fall through
+            # to the text-based fallback below rather than trusting a
+            # low-confidence acoustic read.
+
+        if acoustic_result is not None:
+            results.append(acoustic_result)
+            continue
+
+        # ── FALLBACK: text-level G2P/CMU comparison (ARPAbet vs ARPAbet) ──
+        # Used when the audio clip is unusable, Wav2Vec2 failed, or
+        # confidence was too low to trust the acoustic read.
         user_phon_text = get_phonemes(spoken_word) if spoken_word else ref_phon
         user_norm_text = normalize(user_phon_text)
 
@@ -117,71 +191,11 @@ def detect_errors(alignment: list, audio: np.ndarray, sr: int = 16000,
                 'pred_phon_norm': user_norm_text,
                 'per_word_score': 100.0
             })
-            continue
-
-        if norm_dist_l1 <= L1_THRESHOLD:
+        else:
             error_type = classify_from_dist(norm_dist_l1)
             result = build_result(script_word, error_type, ref_phon,
                                   user_phon_text, norm_dist_l1)
             results.append(result)
-            continue
-
-        # ── LAYER 2: Acoustic check ──
-        start = timing.get('start', 0.0)
-        end = timing.get('end', 0.0)
-        clip_duration = end - start
-
-        if clip_duration < MIN_CLIP_DURATION or start >= end:
-            error_type = classify_from_dist(norm_dist_l1)
-            result = build_result(script_word, error_type, ref_phon,
-                                  user_phon_text, norm_dist_l1)
-            results.append(result)
-            continue
-
-        clip = slice_word_audio(audio, start, end)
-
-        try:
-            pred_phon_ipa, avg_conf, _ = get_spoken_phonemes(clip, sr)
-        except Exception as e:
-            print(f"Warning: Wav2Vec2 failed for '{script_word}': {e}")
-            error_type = classify_from_dist(norm_dist_l1)
-            result = build_result(script_word, error_type, ref_phon,
-                                  user_phon_text, norm_dist_l1)
-            results.append(result)
-            continue
-
-        if not pred_phon_ipa or avg_conf < 0.3:
-            error_type = 'omission' if not pred_phon_ipa else classify_from_dist(norm_dist_l1)
-            result = build_result(script_word, error_type, ref_phon,
-                                  pred_phon_ipa if pred_phon_ipa else user_phon_text,
-                                  norm_dist_l1)
-            results.append(result)
-            continue
-
-        pred_norm = normalize(pred_phon_ipa)
-
-        dist_l2 = Levenshtein.distance(ref_norm, pred_norm)
-        max_len_l2 = max(len(ref_norm), len(pred_norm), 1)
-        norm_dist_l2 = dist_l2 / max_len_l2
-
-        if norm_dist_l2 < 0.001:
-            results.append({
-                'word': script_word,
-                'type': 'correct',
-                'severity': 0,
-                'ref_phon': ref_phon,
-                'pred_phon': pred_phon_ipa,
-                'ref_phon_norm': ref_norm,
-                'pred_phon_norm': pred_norm,
-                'per_word_score': 100.0
-            })
-            continue
-
-        ops = Levenshtein.editops(ref_norm, pred_norm)
-        error_type = classify_ops(ops, ref_norm, pred_norm)
-        result = build_result(script_word, error_type, ref_phon,
-                              pred_phon_ipa, norm_dist_l2)
-        results.append(result)
 
     return results
 
