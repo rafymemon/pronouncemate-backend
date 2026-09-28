@@ -1,13 +1,14 @@
 import logging
+import time
 from typing import List, Dict
 import uuid
 from .audio_processor import preprocess_audio, slice_word_audio
-from .whisper_asr import transcribe
+from .whisper_asr import transcribe, transcribe_for_analysis
 from .g2p_module import build_answer_key, build_script_word_list
 from .alignment import needleman_wunsch
 from .error_detector import detect_errors
 from .scorer import calculate_score
-from .feedback import generate_explanation, get_feedback_audio
+from .feedback import generate_explanation, get_feedback_audio, get_feedback_audio_batch
 from .phoneme_display import to_display_ipa
 
 logger = logging.getLogger(__name__)
@@ -29,13 +30,23 @@ def run_pipeline(raw_audio_path: str, reference_script: str) -> dict:
     Returns:
         dict with score, grade, transcript, words list, feedback list, mistake_summary
     """
+    t_start = time.perf_counter()
+    timings: Dict[str, float] = {}
+
+    def _lap(name: str, since: float) -> float:
+        """Record the elapsed time for a stage and return the new 'now'."""
+        now = time.perf_counter()
+        timings[name] = now - since
+        return now
 
     # ── Stage 1: Preprocess audio ──
+    t = time.perf_counter()
     try:
         audio = preprocess_audio(raw_audio_path)
     except Exception as e:
         logger.error(f"Audio preprocessing failed: {e}")
         return _error_response("Audio preprocessing failed")
+    t = _lap('preprocess', t)
 
     audio_duration = len(audio) / 16000
     logger.info(f'Preprocessed: {audio_duration:.2f}s audio')
@@ -47,10 +58,11 @@ def run_pipeline(raw_audio_path: str, reference_script: str) -> dict:
 
     # ── Stage 2: Transcribe with timestamps ──
     try:
-        transcript = transcribe(audio)
+        transcript = transcribe_for_analysis(audio, reference_script=reference_script)
     except Exception as e:
         logger.error(f"Transcription failed: {e}")
         return _error_response("Transcription failed. Please try again with clearer audio.")
+    t = _lap('transcribe', t)
 
     logger.info(f'Transcribed: {len(transcript)} words')
 
@@ -63,6 +75,7 @@ def run_pipeline(raw_audio_path: str, reference_script: str) -> dict:
     except Exception as e:
         logger.error(f"Answer key generation failed: {e}")
         return _error_response("Failed to process reference script")
+    t = _lap('answer_key', t)
 
     logger.info(f'Answer key: {len(answer_key)} words')
 
@@ -79,6 +92,7 @@ def run_pipeline(raw_audio_path: str, reference_script: str) -> dict:
         return _error_response("Word alignment failed")
 
     alignment_with_timing = _build_alignment_with_timing(alignment, transcript)
+    t = _lap('align', t)
 
     # ── Stage 5: Detect errors ──
     try:
@@ -91,6 +105,7 @@ def run_pipeline(raw_audio_path: str, reference_script: str) -> dict:
     except Exception as e:
         logger.error(f"Error detection failed: {e}")
         return _error_response("Error detection failed")
+    t = _lap('detect_errors', t)
 
     error_count = len([e for e in errors if e["type"] not in ("correct", "inserted")])
     logger.info(f'Detected {error_count} errors out of {len(errors)} words')
@@ -101,6 +116,7 @@ def run_pipeline(raw_audio_path: str, reference_script: str) -> dict:
     except Exception as e:
         logger.error(f"Scoring failed: {e}")
         return _error_response("Scoring failed")
+    t = _lap('score', t)
 
     # ── Stage 7: Build feedback ──
     # IMPORTANT: this list still includes 'inserted' entries (Flutter filters
@@ -108,6 +124,7 @@ def run_pipeline(raw_audio_path: str, reference_script: str) -> dict:
     # computed from the same scoreable set the scorer used, so score and
     # word-count are always consistent with each other.
     words_output, feedback = _build_feedback(errors)
+    t = _lap('feedback_tts', t)
 
     # ── Stage 8: Build mistake summary for Practice Mistakes feature ──
     mistake_summary = _build_mistake_summary(errors)
@@ -120,6 +137,11 @@ def run_pipeline(raw_audio_path: str, reference_script: str) -> dict:
     total_scoreable = len(scoreable)
     wrong_count = total_scoreable - correct_count
     word_accuracy = round((correct_count / total_scoreable) * 100, 1) if total_scoreable else 0.0
+
+    timings['total'] = time.perf_counter() - t_start
+    logger.info(
+        '[timing] ' + ' '.join(f'{name}={secs:.2f}s' for name, secs in timings.items())
+    )
 
     return {
         'success': True,
@@ -194,6 +216,20 @@ def _build_feedback(errors: list) -> tuple:
     words_output = []
     feedback = []
 
+    # Generate TTS audio for all flagged words up front: deduplicated,
+    # in parallel, and time-bounded (see feedback.get_feedback_audio_batch).
+    # Previously this happened one word at a time inside the loop below,
+    # which dominated /api/analyze/ latency on sessions with many errors.
+    words_needing_audio = [
+        e['word'] for e in errors
+        if e['type'] not in ('correct', 'inserted') and e.get('word')
+    ]
+    try:
+        audio_map = get_feedback_audio_batch(words_needing_audio)
+    except Exception as ex:
+        logger.warning(f"TTS batch generation failed: {ex}")
+        audio_map = {}
+
     for e in errors:
         # Display-only conversion — scoring already happened upstream
         # using whichever alphabet (ARPAbet or IPA) each path produced.
@@ -214,7 +250,7 @@ def _build_feedback(errors: list) -> tuple:
         if e['type'] not in ('correct', 'inserted'):
             try:
                 explanation = generate_explanation(e)
-                audio_path = get_feedback_audio(e['word'])
+                audio_path = audio_map.get(e['word'])
                 word_entry['explanation'] = explanation
                 word_entry['audio_path'] = audio_path
 
@@ -281,7 +317,7 @@ def _build_mistake_summary(errors: list) -> dict:
         'all_mistakes': mistakes
     }
 
-    
+
 
 
 
