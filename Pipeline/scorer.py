@@ -35,6 +35,7 @@ def calculate_score(errors: List[Dict]) -> Dict:
             'severity_total': 0, 'severity_avg': 0.0,
             'total_words': 0, 'scored_words': 0,
             'skipped_words': 0, 'flagged_words': 0, 'inserted_words': 0,
+            'minor_words': 0,
             'breakdown': []
         }
 
@@ -44,6 +45,7 @@ def calculate_score(errors: List[Dict]) -> Dict:
     skipped = 0
     flagged = 0
     inserted = 0
+    minor = 0
     breakdown = []
 
     for e in errors:
@@ -81,6 +83,17 @@ def calculate_score(errors: List[Dict]) -> Dict:
             # Forgiven Pakistani-accent variant — already scored generously
             # by error_detector (min(sim+8, 95%)). Do not re-flag as an error.
             word_score = e.get('per_word_score', 90.0)
+        elif err_type == 'minor':
+            # Close-but-not-exact acoustic read (see error_detector's
+            # MINOR_DIST_THRESHOLD) — counted as flagged for accuracy
+            # purposes but carries a generous per_word_score already
+            # computed from its small phoneme distance, not a hard penalty.
+            word_score = e.get('per_word_score')
+            if word_score is None:
+                from .error_detector import per_word_score_from_lists
+                word_score = per_word_score_from_lists(ref_phon, pred_phon)
+            minor += 1
+            flagged += 1
         elif err_type in ('substituted', 'partial', 'substitution', 'omission', 'insertion', 'stress'):
             word_score = e.get('per_word_score')
             if word_score is None:
@@ -124,6 +137,7 @@ def calculate_score(errors: List[Dict]) -> Dict:
         'skipped_words': skipped,
         'flagged_words': flagged,
         'inserted_words': inserted,
+        'minor_words': minor,
         'breakdown': breakdown
     }
 

@@ -102,6 +102,15 @@ class UserProfile(models.Model):
     proficiency_level= models.CharField(max_length=15, choices=LEVEL_CHOICES, default='beginner')
     reference_accent = models.CharField(max_length=20, choices=ACCENTS, default='american')
     voice_feedback   = models.BooleanField(default=True)
+    daily_reminders       = models.BooleanField(default=True)
+    auto_save_recordings  = models.BooleanField(default=False)
+
+    # NEW: tracks the user's best-ever consecutive-day streak, so the
+    # notification system can tell "you're on a streak" (already known
+    # via PracticeSession dates) apart from "you just beat your personal
+    # record" (which needs a persisted high-water mark).
+    longest_streak   = models.IntegerField(default=0)
+
     total_sessions   = models.IntegerField(default=0)
     best_score       = models.FloatField(default=0.0)
     created_at       = models.DateTimeField(auto_now_add=True)
@@ -211,3 +220,31 @@ class FocusScript(models.Model):
     completed_at     = models.DateTimeField(null=True, blank=True)
     pre_error_rate   = models.FloatField(null=True, blank=True)
     post_error_rate  = models.FloatField(null=True, blank=True)
+
+
+class Notification(models.Model):
+    """
+    In-app notification feed. Populated by:
+      - notifications.notify_level_up()          — ConfirmPromotionView
+      - notifications.check_streak_notifications() — AnalyzeView, per session
+      - notifications.notify_focus_script_ready() — AnalyzeView, per session
+    """
+    TYPE_CHOICES = [
+        ('level_up',         'Level Up'),
+        ('streak_milestone', 'Streak Milestone'),
+        ('longest_streak',   'Longest Streak'),
+        ('focus_script',     'Focus Script Ready'),
+    ]
+
+    user       = models.ForeignKey(User, on_delete=models.CASCADE, related_name='notifications')
+    notif_type = models.CharField(max_length=20, choices=TYPE_CHOICES)
+    title      = models.CharField(max_length=120)
+    message    = models.CharField(max_length=300)
+    is_read    = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f'{self.user.username}: {self.title} ({"read" if self.is_read else "unread"})'

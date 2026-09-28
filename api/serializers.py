@@ -32,8 +32,8 @@ class UserProfileSerializer(serializers.ModelSerializer):
     class Meta:
         model = UserProfile
         fields = ['username', 'email', 'proficiency_level', 'reference_accent',
-                  'voice_feedback', 'total_sessions', 'best_score']
-
+                  'voice_feedback', 'daily_reminders', 'auto_save_recordings',
+                  'total_sessions', 'best_score']
 
 class ScriptSerializer(serializers.ModelSerializer):
     word_count = serializers.SerializerMethodField()

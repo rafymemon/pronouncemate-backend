@@ -44,15 +44,41 @@ def preprocess_audio(file_path: str) -> np.ndarray:
 
 
 def slice_word_audio(audio: np.ndarray, start_sec: float,
-                     end_sec: float, pad_ms: int = 50) -> np.ndarray:
+                     end_sec: float, pad_ms: int = 50,
+                     prev_end_sec: float | None = None,
+                     next_start_sec: float | None = None) -> np.ndarray:
     """
     Slice per-word audio clip using Whisper timestamps.
     pad_ms: milliseconds of context added each side (helps Wav2Vec2 accuracy).
     Returns minimum 0.15s clip (zero-padded if shorter).
+
+    prev_end_sec / next_start_sec: optional timestamps of the NEIGHBORING
+    words in the utterance. When provided, padding is clamped so it can
+    never cross into a neighboring word's own timestamp range. Without
+    this, the pad_ms context window (meant to help Wav2Vec2 by including
+    a bit of natural onset/release) can instead pull in the tail of the
+    previous word or the onset of the next one whenever words are spoken
+    close together — this was the root cause of acoustic predictions
+    coming back contaminated with fragments of adjacent words.
     """
     pad = int(pad_ms * TARGET_SR / 1000)
     s = max(0, int(start_sec * TARGET_SR) - pad)
     e = min(len(audio), int(end_sec * TARGET_SR) + pad)
+
+    if prev_end_sec is not None:
+        s = max(s, int(prev_end_sec * TARGET_SR))
+    if next_start_sec is not None:
+        e = min(e, int(next_start_sec * TARGET_SR))
+
+    # If clamping collapsed the window (e.g. Whisper still reported
+    # touching/overlapping timestamps for adjacent words even after the
+    # monotonic clamp in whisper_asr.py), fall back to the unpadded
+    # original start/end rather than producing an empty or negative-length
+    # clip.
+    if e <= s:
+        s = max(0, int(start_sec * TARGET_SR))
+        e = min(len(audio), int(end_sec * TARGET_SR))
+
     clip = audio[s:e]
     
     # Pad short clips to minimum 0.15s (2400 samples)

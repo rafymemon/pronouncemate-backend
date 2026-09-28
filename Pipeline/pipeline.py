@@ -70,7 +70,6 @@ def run_pipeline(raw_audio_path: str, reference_script: str) -> dict:
         return _error_response("Reference script is empty or invalid")
 
     # ── Stage 4: Align spoken words to script words ──
-    # ── Stage 4: Align spoken words to script words ──
     spoken_words = [w['word'] for w in transcript]
     script_words = build_script_word_list(reference_script)   # ← was list(answer_key.keys())
     try:
@@ -140,6 +139,7 @@ def run_pipeline(raw_audio_path: str, reference_script: str) -> dict:
             'skipped_words': score_result.get('skipped_words', 0),
             'flagged_words': score_result.get('flagged_words', 0),
             'inserted_words': score_result.get('inserted_words', 0),
+            'minor_words': score_result.get('minor_words', 0),
             'severity_total': score_result.get('severity_total', 0),
             'audio_duration': round(audio_duration, 2),
 
@@ -281,6 +281,8 @@ def _build_mistake_summary(errors: list) -> dict:
         'all_mistakes': mistakes
     }
 
+    
+
 
 
 
@@ -312,6 +314,7 @@ def _error_response(message: str) -> dict:
             'skipped_words': 0,
             'flagged_words': 0,
             'inserted_words': 0,
+            'minor_words': 0,
             'severity_total': 0,
             'audio_duration': 0.0,
         }

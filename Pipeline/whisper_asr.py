@@ -107,7 +107,23 @@ def transcribe(audio_array: np.ndarray, sr: int = 16000,
             if w.probability < min_word_prob:
                 continue
 
-            duration = w.end - w.start
+            start = round(w.start, 3)
+            end = round(w.end, 3)
+
+            # ── Clamp against overlap with the previous word ──
+            # Faster-Whisper's word-level timestamps come from a
+            # DTW/cross-attention alignment and occasionally report a
+            # word's start slightly BEFORE the previous word's end,
+            # especially in fast/continuous speech. Left uncorrected,
+            # downstream per-word audio slicing (slice_word_audio) ends
+            # up including part of the previous word's audio in this
+            # word's acoustic-check clip — which was causing every
+            # Wav2Vec2 phoneme prediction to come back contaminated with
+            # a fragment of the previous word.
+            if prev_word and start < prev_word['end']:
+                start = prev_word['end']
+
+            duration = end - start
             if duration < min_word_duration:
                 continue
 
@@ -119,14 +135,14 @@ def transcribe(audio_array: np.ndarray, sr: int = 16000,
                 continue
 
             if prev_word and word == prev_word['word']:
-                prev_word['end'] = round(w.end, 3)
+                prev_word['end'] = end
                 prev_word['prob'] = max(prev_word['prob'], round(w.probability, 3))
                 continue
 
             word_dict = {
                 'word':  word,
-                'start': round(w.start, 3),
-                'end':   round(w.end, 3),
+                'start': start,
+                'end':   end,
                 'prob':  round(w.probability, 3),
                 'duration': round(duration, 3)
             }

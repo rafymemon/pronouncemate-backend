@@ -4,13 +4,20 @@ import numpy as np
 from typing import List, Dict, Tuple, Optional
 
 from .g2p_module import get_phonemes, build_answer_key
-from .wav2vec_phonemes import recognize_phonemes, get_spoken_phonemes, text_to_phonemes
-from .audio_processor import slice_word_audio
+from .wav2vec_phonemes import (
+    recognize_phonemes,
+    recognize_phonemes_with_timestamps,
+    bucket_phonemes_by_word,
+    text_to_phonemes,
+)
+from .accent_rules import check_accent_pattern, accent_score
 
 
 # ── Severity Scale ─────────────────────────────────────────────
 SEVERITY = {
     'correct':      0,
+    'accent':       0,   # forgiven Pakistani-accent variant — never penalized
+    'minor':        2,   # close-but-not-exact acoustic read — see MINOR_DIST_THRESHOLD
     'substitution': 6,
     'omission':     7,
     'insertion':    4,
@@ -39,7 +46,55 @@ def normalize(phonemes: list) -> list:
 
 # ── Configuration ─────────────────────────────────────────────
 L1_THRESHOLD = 0.15
+
+# A word's Whisper timing must be at least this long to be treated as
+# acoustically usable at all — below this, timing is too unreliable to
+# trust for bucketing and the word falls straight to the text fallback.
 MIN_CLIP_DURATION = 0.15
+
+# A substitution/omission/insertion whose normalized phoneme edit distance
+# is at or below this is downgraded to 'minor' instead of a hard error —
+# e.g. a dropped plural -s, a slightly shortened vowel, a light final-
+# consonant softening. These are real, technically-imperfect reads, but
+# categorically different from a word that came out almost unrecognizable.
+# TUNABLE: pick this value empirically against a labeled eval set once
+# you have one for the thesis — 0.35 is a reasonable starting point based
+# on observed session data, not a derived constant.
+MINOR_DIST_THRESHOLD = 0.35
+
+# TEMPORARY — diagnostic flag. Prints ref/pred phonemes and which code
+# path each word took. Flip to True when validating this change; leave
+# False otherwise.
+DEBUG_DETECTION = True
+
+
+def _find_prev_end(timings: list, i: int) -> Optional[float]:
+    """Walk backward from index i for the nearest word with real timing."""
+    for j in range(i - 1, -1, -1):
+        if timings[j] is not None:
+            return timings[j][1]
+    return None
+
+
+def _find_next_start(timings: list, i: int) -> Optional[float]:
+    """Walk forward from index i for the nearest word with real timing."""
+    for j in range(i + 1, len(timings)):
+        if timings[j] is not None:
+            return timings[j][0]
+    return None
+
+
+def _maybe_downgrade_to_minor(error_type: str, norm_dist: float) -> str:
+    """
+    Downgrade a hard substitution/omission/insertion verdict to 'minor'
+    when the underlying phoneme distance is small enough that this was a
+    close, largely-correct read rather than a genuinely different word.
+    Never touches 'correct', 'accent', 'skipped', or 'inserted' — those
+    are decided elsewhere and never pass through here.
+    """
+    if error_type in ('substitution', 'omission', 'insertion') and norm_dist <= MINOR_DIST_THRESHOLD:
+        return 'minor'
+    return error_type
 
 
 # ── Main Detection ────────────────────────────────────────────
@@ -47,15 +102,41 @@ def detect_errors(alignment: list, audio: np.ndarray, sr: int = 16000,
                   answer_key: dict = None, script_text: str = None) -> list:
     """
     For each aligned (spoken_word_info, script_word) pair:
-      1. Try the ACOUSTIC check first (Wav2Vec2 on the audio clip) —
+      1. Compare against a per-word bucket of phonemes drawn from ONE
+         continuous Wav2Vec2 decode of the whole utterance (see below) —
          this is the real pronunciation verification, since it's derived
          from what was actually spoken rather than Whisper's ASR text,
          which tends to auto-correct mispronounced-but-recognizable words
          back to the intended dictionary spelling.
-      2. Fall back to the text-level G2P/CMU comparison only when the
-         audio clip is unusable (too short, bad timestamps, or the
-         Wav2Vec2 call fails / returns low confidence).
-      3. Classify error type from editops backtrace.
+      2. If the acoustic reading isn't an exact match, check it against
+         the Pakistani-accent tolerance patterns (accent_rules.py) BEFORE
+         falling back to generic substitution/omission classification.
+         Only a clean match against the forgiven pattern list is scored
+         as 'accent'; anything else — including the flagged f/p case —
+         falls through to normal classification.
+      3. If it's not an accent match either, classify from editops, then
+         downgrade to 'minor' if the phoneme distance is small enough
+         that this was a close read rather than a genuinely wrong word
+         (see MINOR_DIST_THRESHOLD).
+      4. Fall back to the text-level G2P/CMU comparison only when the
+         word's timing is unusable (too short, missing) or the bucket
+         came back empty/low-confidence. Same accent- and minor-downgrade
+         logic applies there too.
+
+    METHODOLOGY NOTE — continuous decode + bucketing, not per-word slicing:
+    Earlier versions of this pipeline sliced a separate audio clip per
+    word (via slice_word_audio) and ran Wav2Vec2 on each clip in
+    isolation. That approach removes exactly the phonetic context
+    (coarticulation with neighboring words) Wav2Vec2 needs to recognize
+    short/fast speech correctly — testing showed heavy contamination
+    (leading/trailing phoneme fragments from neighboring words) even
+    after correcting Whisper's own word-boundary timestamps. This version
+    instead runs Wav2Vec2 ONCE on the full utterance audio
+    (recognize_phonemes_with_timestamps), then splits that single
+    continuous phoneme timeline into per-word groups purely by timestamp
+    (bucket_phonemes_by_word) — the audio itself is never re-cut, so the
+    model always has full context. This is also strictly cheaper: one
+    forward pass per utterance instead of one per word.
 
     IMPORTANT — phoneme alphabets are NOT interchangeable:
       - answer_key (from g2p_module/CMU dict) is ARPAbet.
@@ -67,19 +148,47 @@ def detect_errors(alignment: list, audio: np.ndarray, sr: int = 16000,
       reference via text_to_phonemes() (espeak), completely separate
       from answer_key. The text-fallback branch keeps using
       answer_key/CMU (ARPAbet-vs-ARPAbet, internally consistent) since
-      it never touches Wav2Vec2 output.
+      it never touches Wav2Vec2 output. The accent-tolerance check runs
+      in BOTH branches, but always against phonemes in that branch's own
+      alphabet — never mixed.
     """
     if answer_key is None and script_text is not None:
         answer_key = build_answer_key(script_text)
     if answer_key is None:
         raise ValueError("Must provide either answer_key or script_text")
 
+    # Precompute (start, end) or None for every alignment position, so
+    # each word can look up its actual timing — skipped/inserted entries
+    # have no real audio timing.
+    timings = []
+    for spoken_info, _ in alignment:
+        if isinstance(spoken_info, dict) and 'start' in spoken_info and 'end' in spoken_info:
+            timings.append((spoken_info['start'], spoken_info['end']))
+        else:
+            timings.append(None)
+
+    # ── ONE continuous Wav2Vec2 decode for the whole utterance ──
+    # Replaces the old per-word slice_word_audio() + get_spoken_phonemes()
+    # calls. See the methodology note in the docstring above.
+    try:
+        phoneme_timeline = recognize_phonemes_with_timestamps(audio, sr)
+    except Exception as e:
+        print(f"Warning: whole-utterance Wav2Vec2 decode failed: {e}")
+        phoneme_timeline = []
+
+    word_phoneme_buckets = bucket_phonemes_by_word(phoneme_timeline, timings)
+
+    if DEBUG_DETECTION:
+        print(f"[DEBUG] utterance-level phoneme timeline: {len(phoneme_timeline)} phonemes decoded")
+
     results = []
 
-    for spoken_info, script_word in alignment:
+    for i, (spoken_info, script_word) in enumerate(alignment):
 
         # ── Skipped word ──
         if spoken_info is None:
+            if DEBUG_DETECTION:
+                print(f"[DEBUG] '{script_word}': SKIPPED (no spoken word aligned)")
             results.append({
                 'word': script_word,
                 'type': 'skipped',
@@ -98,6 +207,8 @@ def detect_errors(alignment: list, audio: np.ndarray, sr: int = 16000,
 
         # ── Inserted word ──
         if script_word is None or script_word == '':
+            if DEBUG_DETECTION:
+                print(f"[DEBUG] '{spoken_word}': INSERTED (no script word aligned)")
             results.append({
                 'word': spoken_word,
                 'type': 'inserted',
@@ -116,25 +227,27 @@ def detect_errors(alignment: list, audio: np.ndarray, sr: int = 16000,
             ref_phon = get_phonemes(script_word)
         ref_norm = normalize(ref_phon)
 
-        # ── Try ACOUSTIC check first ──
+        # ── Try ACOUSTIC check first, using this word's phoneme bucket ──
         start = timing.get('start', 0.0)
         end = timing.get('end', 0.0)
         clip_duration = end - start
-        clip_usable = clip_duration >= MIN_CLIP_DURATION and start < end
+        timing_usable = clip_duration >= MIN_CLIP_DURATION and start < end
+
+        bucket = word_phoneme_buckets[i]
+        pred_phon_ipa = bucket['phonemes']
+        avg_conf = bucket['avg_confidence']
+
+        if DEBUG_DETECTION:
+            print(f"[DEBUG] '{script_word}': spoken='{spoken_word}' "
+                  f"duration={clip_duration:.3f}s timing_usable={timing_usable} "
+                  f"bucket_phonemes={pred_phon_ipa} avg_conf={avg_conf:.3f}")
 
         acoustic_result = None
-        if clip_usable:
+        if timing_usable:
             # IPA reference for THIS branch only — never mix with the
             # ARPAbet ref_phon/ref_norm computed above.
             ref_phon_ipa = text_to_phonemes(script_word)
             ref_norm_ipa = normalize(ref_phon_ipa)
-
-            clip = slice_word_audio(audio, start, end)
-            try:
-                pred_phon_ipa, avg_conf, _ = get_spoken_phonemes(clip, sr)
-            except Exception as e:
-                print(f"Warning: Wav2Vec2 failed for '{script_word}': {e}")
-                pred_phon_ipa, avg_conf = None, 0.0
 
             if pred_phon_ipa and avg_conf >= 0.3:
                 pred_norm = normalize(pred_phon_ipa)
@@ -143,6 +256,8 @@ def detect_errors(alignment: list, audio: np.ndarray, sr: int = 16000,
                 norm_dist_l2 = dist_l2 / max_len_l2
 
                 if norm_dist_l2 < 0.001:
+                    if DEBUG_DETECTION:
+                        print(f"[DEBUG]   -> CORRECT (exact acoustic match)")
                     acoustic_result = {
                         'word': script_word,
                         'type': 'correct',
@@ -154,16 +269,41 @@ def detect_errors(alignment: list, audio: np.ndarray, sr: int = 16000,
                         'per_word_score': 100.0
                     }
                 else:
-                    ops = Levenshtein.editops(ref_norm_ipa, pred_norm)
-                    error_type = classify_ops(ops, ref_norm_ipa, pred_norm)
-                    acoustic_result = build_result(script_word, error_type, ref_phon_ipa,
-                                                    pred_phon_ipa, norm_dist_l2)
+                    accent_match = check_accent_pattern(ref_norm_ipa, pred_norm)
+                    if accent_match:
+                        if DEBUG_DETECTION:
+                            print(f"[DEBUG]   -> ACCENT ({accent_match}), dist={norm_dist_l2:.3f}")
+                        acoustic_result = {
+                            'word': script_word,
+                            'type': 'accent',
+                            'severity': SEVERITY['accent'],
+                            'ref_phon': ref_phon_ipa,
+                            'pred_phon': pred_phon_ipa,
+                            'ref_phon_norm': ref_norm_ipa,
+                            'pred_phon_norm': pred_norm,
+                            'accent_pattern': accent_match,
+                            'per_word_score': accent_score(norm_dist_l2)
+                        }
+                    else:
+                        ops = Levenshtein.editops(ref_norm_ipa, pred_norm)
+                        error_type = classify_ops(ops, ref_norm_ipa, pred_norm)
+                        error_type = _maybe_downgrade_to_minor(error_type, norm_dist_l2)
+                        if DEBUG_DETECTION:
+                            print(f"[DEBUG]   -> {error_type.upper()} (no accent match), "
+                                  f"dist={norm_dist_l2:.3f}, ops={ops}")
+                        acoustic_result = build_result(script_word, error_type, ref_phon_ipa,
+                                                        pred_phon_ipa, norm_dist_l2)
             elif pred_phon_ipa == [] or pred_phon_ipa is None:
-                # Wav2Vec2 ran but detected no usable phonemes in the clip
+                # Bucket came back empty — no phonemes from the utterance
+                # decode landed in this word's time range at all.
+                if DEBUG_DETECTION:
+                    print(f"[DEBUG]   -> OMISSION (empty bucket)")
                 acoustic_result = build_result(script_word, 'omission', ref_phon_ipa,
                                                 [], 1.0)
-            # else: low confidence but non-empty prediction — fall through
-            # to the text-based fallback below rather than trusting a
+            elif DEBUG_DETECTION:
+                print(f"[DEBUG]   -> low confidence ({avg_conf:.3f}), falling through to text fallback")
+            # else: low confidence but non-empty bucket — fall through to
+            # the text-based fallback below rather than trusting a
             # low-confidence acoustic read.
 
         if acoustic_result is not None:
@@ -171,8 +311,11 @@ def detect_errors(alignment: list, audio: np.ndarray, sr: int = 16000,
             continue
 
         # ── FALLBACK: text-level G2P/CMU comparison (ARPAbet vs ARPAbet) ──
-        # Used when the audio clip is unusable, Wav2Vec2 failed, or
-        # confidence was too low to trust the acoustic read.
+        # Used when the word's timing is unusable, the bucket was empty,
+        # or confidence was too low to trust the acoustic read.
+        if DEBUG_DETECTION:
+            print(f"[DEBUG]   -> using TEXT FALLBACK (Whisper transcript vs answer key)")
+
         user_phon_text = get_phonemes(spoken_word) if spoken_word else ref_phon
         user_norm_text = normalize(user_phon_text)
 
@@ -181,6 +324,8 @@ def detect_errors(alignment: list, audio: np.ndarray, sr: int = 16000,
         norm_dist_l1 = dist_l1 / max_len_l1
 
         if norm_dist_l1 < 0.001:
+            if DEBUG_DETECTION:
+                print(f"[DEBUG]   -> CORRECT (text fallback exact match)")
             results.append({
                 'word': script_word,
                 'type': 'correct',
@@ -192,10 +337,30 @@ def detect_errors(alignment: list, audio: np.ndarray, sr: int = 16000,
                 'per_word_score': 100.0
             })
         else:
-            error_type = classify_from_dist(norm_dist_l1)
-            result = build_result(script_word, error_type, ref_phon,
-                                  user_phon_text, norm_dist_l1)
-            results.append(result)
+            accent_match = check_accent_pattern(ref_norm, user_norm_text)
+            if accent_match:
+                if DEBUG_DETECTION:
+                    print(f"[DEBUG]   -> ACCENT ({accent_match}) via text fallback, dist={norm_dist_l1:.3f}")
+                results.append({
+                    'word': script_word,
+                    'type': 'accent',
+                    'severity': SEVERITY['accent'],
+                    'ref_phon': ref_phon,
+                    'pred_phon': user_phon_text,
+                    'ref_phon_norm': ref_norm,
+                    'pred_phon_norm': user_norm_text,
+                    'accent_pattern': accent_match,
+                    'per_word_score': accent_score(norm_dist_l1)
+                })
+            else:
+                error_type = classify_from_dist(norm_dist_l1)
+                error_type = _maybe_downgrade_to_minor(error_type, norm_dist_l1)
+                if DEBUG_DETECTION:
+                    print(f"[DEBUG]   -> {error_type.upper()} via text fallback, dist={norm_dist_l1:.3f}, "
+                          f"ref={ref_norm} vs spoken_word_g2p={user_norm_text}")
+                result = build_result(script_word, error_type, ref_phon,
+                                      user_phon_text, norm_dist_l1)
+                results.append(result)
 
     return results
 
@@ -233,7 +398,7 @@ def classify_ops(ops: list, ref: list, pred: list) -> str:
 
 
 def classify_from_dist(norm_dist: float) -> str:
-    """Fallback classifier when audio clip is too short for Wav2Vec2."""
+    """Fallback classifier when word timing is too short/unreliable for the acoustic path."""
     if norm_dist < 0.001:
         return 'correct'
     if norm_dist <= 0.2:
@@ -247,6 +412,10 @@ def assign_severity(error_type: str, ops: list) -> int:
     """Assign severity based on error type AND number of operations."""
     if error_type == 'correct':
         return 0
+    if error_type == 'accent':
+        return SEVERITY['accent']
+    if error_type == 'minor':
+        return SEVERITY['minor']
     if error_type == 'skipped':
         return SEVERITY['skipped']
     if error_type == 'stress':
