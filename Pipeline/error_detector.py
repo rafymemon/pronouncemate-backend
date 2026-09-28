@@ -62,6 +62,19 @@ MIN_CLIP_DURATION = 0.15
 # on observed session data, not a derived constant.
 MINOR_DIST_THRESHOLD = 0.35
 
+# ── Boundary refinement (see refine_bucket_boundaries) ────────
+# Whisper's word timestamps are only accurate to a few tens of ms, and
+# short function words are often off by more than that. Because the
+# acoustic path buckets phonemes purely by those timestamps, edge phonemes
+# routinely land in the neighbouring word's bucket ("my" gets the /n/ of
+# "name", "a" gets the "soft" of a word Whisper dropped, etc.). Refinement
+# re-assigns edge phonemes between ADJACENT words whenever doing so
+# strictly lowers the combined edit distance to the two words' references.
+# Set REFINE_BOUNDARIES = False to get the previous behaviour back.
+REFINE_BOUNDARIES = True
+MAX_BOUNDARY_SHIFT = 4      # max phonemes moved across one boundary per step
+BOUNDARY_PASSES = 3         # max left-to-right sweeps over the utterance
+
 # TEMPORARY — diagnostic flag. Prints ref/pred phonemes and which code
 # path each word took. Flip to True when validating this change; leave
 # False otherwise.
@@ -95,6 +108,98 @@ def _maybe_downgrade_to_minor(error_type: str, norm_dist: float) -> str:
     if error_type in ('substitution', 'omission', 'insertion') and norm_dist <= MINOR_DIST_THRESHOLD:
         return 'minor'
     return error_type
+
+
+# ── Boundary refinement ───────────────────────────────────────
+def refine_bucket_boundaries(phoneme_lists: List[list],
+                             ref_lists: List[list],
+                             confs: List[float],
+                             max_shift: int = MAX_BOUNDARY_SHIFT,
+                             max_passes: int = BOUNDARY_PASSES
+                             ) -> Tuple[List[list], List[float], List[tuple]]:
+    """
+    Re-assign edge phonemes between adjacent words' buckets.
+
+    For every adjacent pair (i, i+1) we try moving the last k phonemes of
+    word i to the front of word i+1, and the first k phonemes of word i+1
+    to the end of word i (k = 1..max_shift). A move is applied only if it
+    STRICTLY lowers  dist(bucket_i, ref_i) + dist(bucket_i+1, ref_i+1),
+    where dist is the raw phoneme edit distance. Sweeps repeat (up to
+    max_passes) so a phoneme can travel across a short word in a chain.
+
+    Only bucket edges are ever touched and only when a neighbour's reference
+    explains the phonemes better, so a phoneme that genuinely belongs to a
+    mispronounced word stays with it: moving it would not reduce the total.
+
+    Words with no reference (inserted words) have an empty reference list;
+    skipped words keep their real reference and start with an empty bucket.
+    Both can therefore donate/absorb phonemes without special-casing.
+
+    Returns (new_phoneme_lists, new_confs, moves), where each move is
+    (left_index, right_index, direction, moved_phonemes) and direction is
+    'right' (left -> right) or 'left' (right -> left).
+
+    avg_confidence is not recomputable from the bucket alone, so it is
+    approximated: a bucket keeps its own value, a previously-empty bucket
+    that receives phonemes inherits the donor's value, and a bucket that is
+    emptied drops to 0.0.
+    """
+    P = [list(p) for p in phoneme_lists]
+    C = list(confs)
+    R = [normalize(r) for r in ref_lists]
+    moves: List[tuple] = []
+
+    def cost(pred: list, idx: int) -> int:
+        return Levenshtein.distance(normalize(pred), R[idx])
+
+    for _ in range(max_passes):
+        changed = False
+        for i in range(len(P) - 1):
+            left, right = P[i], P[i + 1]
+            base = cost(left, i) + cost(right, i + 1)
+            if base == 0:
+                continue
+
+            best_cost = base
+            best = None  # (new_left, new_right, direction, k)
+
+            for k in range(1, min(max_shift, len(left)) + 1):
+                new_left, new_right = left[:-k], left[-k:] + right
+                c = cost(new_left, i) + cost(new_right, i + 1)
+                if c < best_cost:
+                    best_cost, best = c, (new_left, new_right, 'right', k)
+
+            for k in range(1, min(max_shift, len(right)) + 1):
+                new_left, new_right = left + right[:k], right[k:]
+                c = cost(new_left, i) + cost(new_right, i + 1)
+                if c < best_cost:
+                    best_cost, best = c, (new_left, new_right, 'left', k)
+
+            if best is None:
+                continue
+
+            new_left, new_right, direction, k = best
+            if direction == 'right':
+                moved = left[-k:]
+                if not right:
+                    C[i + 1] = C[i]
+                if not new_left:
+                    C[i] = 0.0
+            else:
+                moved = right[:k]
+                if not left:
+                    C[i] = C[i + 1]
+                if not new_right:
+                    C[i + 1] = 0.0
+
+            P[i], P[i + 1] = new_left, new_right
+            moves.append((i, i + 1, direction, list(moved)))
+            changed = True
+
+        if not changed:
+            break
+
+    return P, C, moves
 
 
 # ── Main Detection ────────────────────────────────────────────
@@ -138,6 +243,15 @@ def detect_errors(alignment: list, audio: np.ndarray, sr: int = 16000,
     model always has full context. This is also strictly cheaper: one
     forward pass per utterance instead of one per word.
 
+    METHODOLOGY NOTE — boundary refinement:
+    Timestamp bucketing still leaks edge phonemes into neighbouring words
+    when Whisper's word times are slightly off (common for short function
+    words, and for any word Whisper dropped or renamed, e.g. names and
+    acronyms). refine_bucket_boundaries() runs after bucketing and moves
+    edge phonemes between adjacent buckets only when that strictly lowers
+    the combined edit distance to the two words' IPA references. See the
+    REFINE_BOUNDARIES switch in the configuration block.
+
     IMPORTANT — phoneme alphabets are NOT interchangeable:
       - answer_key (from g2p_module/CMU dict) is ARPAbet.
       - Wav2Vec2 (facebook/wav2vec2-lv-60-espeak-cv-ft) outputs
@@ -156,6 +270,15 @@ def detect_errors(alignment: list, audio: np.ndarray, sr: int = 16000,
         answer_key = build_answer_key(script_text)
     if answer_key is None:
         raise ValueError("Must provide either answer_key or script_text")
+
+    # Per-call cache: the same word ("i", "and", "am") recurs many times in
+    # a script and espeak only needs to be asked once per distinct word.
+    _ipa_cache: Dict[str, list] = {}
+
+    def _ipa(word: str) -> list:
+        if word not in _ipa_cache:
+            _ipa_cache[word] = text_to_phonemes(word)
+        return _ipa_cache[word]
 
     # Precompute (start, end) or None for every alignment position, so
     # each word can look up its actual timing — skipped/inserted entries
@@ -180,6 +303,46 @@ def detect_errors(alignment: list, audio: np.ndarray, sr: int = 16000,
 
     if DEBUG_DETECTION:
         print(f"[DEBUG] utterance-level phoneme timeline: {len(phoneme_timeline)} phonemes decoded")
+
+    # ── Boundary refinement ──
+    if REFINE_BOUNDARIES and len(alignment) > 1:
+        try:
+            n = len(alignment)
+            raw = list(word_phoneme_buckets)
+            if len(raw) < n:
+                raw += [None] * (n - len(raw))
+
+            phoneme_lists = [list((b or {}).get('phonemes') or []) for b in raw[:n]]
+            confs = [float((b or {}).get('avg_confidence') or 0.0) for b in raw[:n]]
+            ref_lists = [_ipa(sw) if sw else [] for _, sw in alignment]
+
+            new_lists, new_confs, moves = refine_bucket_boundaries(
+                phoneme_lists, ref_lists, confs
+            )
+
+            if moves:
+                if DEBUG_DETECTION:
+                    labels = []
+                    for spoken_info, sw in alignment:
+                        if sw:
+                            labels.append(sw)
+                        elif isinstance(spoken_info, dict):
+                            labels.append(f"+{spoken_info.get('word', '?')}")
+                        else:
+                            labels.append('?')
+                    print(f"[DEBUG] boundary refinement: {len(moves)} move(s)")
+                    for li, ri, direction, moved in moves:
+                        src, dst = (li, ri) if direction == 'right' else (ri, li)
+                        print(f"[DEBUG]   moved {moved} from '{labels[src]}' -> '{labels[dst]}'")
+
+                word_phoneme_buckets = [
+                    {'phonemes': p, 'avg_confidence': c}
+                    for p, c in zip(new_lists, new_confs)
+                ]
+        except Exception as e:
+            # Refinement is an improvement, never a requirement: on any
+            # failure fall back to the raw timestamp buckets.
+            print(f"Warning: boundary refinement failed, using raw buckets: {e}")
 
     results = []
 
@@ -246,7 +409,7 @@ def detect_errors(alignment: list, audio: np.ndarray, sr: int = 16000,
         if timing_usable:
             # IPA reference for THIS branch only — never mix with the
             # ARPAbet ref_phon/ref_norm computed above.
-            ref_phon_ipa = text_to_phonemes(script_word)
+            ref_phon_ipa = _ipa(script_word)
             ref_norm_ipa = normalize(ref_phon_ipa)
 
             if pred_phon_ipa and avg_conf >= 0.3:

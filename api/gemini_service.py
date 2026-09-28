@@ -22,11 +22,25 @@ MODE_LABELS = {
     'script_based':       'Script-Based',
 }
 
+# Timeouts are in milliseconds. Without these the SDK keeps retrying 503s
+# for 15-30s, which makes the Flutter client time out before the server's
+# pool fallback can respond.
+DEFAULT_TIMEOUT_MS = 10_000      # per attempt, client-wide default
+DEFAULT_ATTEMPTS = 2             # initial call + 1 retry
+ROTATION_TIMEOUT_MS = 7_000      # rotation must fail fast -> pool fallback
+ROTATION_ATTEMPTS = 1            # no retries; the pool is the fallback
+
 
 def _get_client():
     global _client
     if _client is None:
-        _client = genai.Client(api_key=settings.GEMINI_API_KEY)
+        _client = genai.Client(
+            api_key=settings.GEMINI_API_KEY,
+            http_options=types.HttpOptions(
+                timeout=DEFAULT_TIMEOUT_MS,
+                retry_options=types.HttpRetryOptions(attempts=DEFAULT_ATTEMPTS),
+            ),
+        )
     return _client
 
 
@@ -67,8 +81,12 @@ def generate_rotation_scripts(mode: str, level: str, count: int = 1) -> list[dic
     Rotation via a single Gemini call (batched, not one call per script).
 
     Returns a list of dicts shaped {'title': str, 'content': str}. Returns
-    an empty list on any failure (API error, malformed JSON, etc.) so the
-    caller (api/rotation.py) can fall back to the curated built-in pool.
+    an empty list on any failure (API error, timeout, malformed JSON, etc.)
+    so the caller (api/rotation.py) can fall back to the curated built-in pool.
+
+    This call uses a short timeout and no retries so a Gemini outage
+    (e.g. 503 high demand) falls back to the pool in seconds, not tens of
+    seconds.
     """
     mode_label = MODE_LABELS.get(mode, mode)
 
@@ -97,6 +115,10 @@ The array must contain exactly {count} item(s)."""
             contents=prompt,
             config=types.GenerateContentConfig(
                 max_output_tokens=250 * count + 150,
+                http_options=types.HttpOptions(
+                    timeout=ROTATION_TIMEOUT_MS,
+                    retry_options=types.HttpRetryOptions(attempts=ROTATION_ATTEMPTS),
+                ),
             ),
         )
 

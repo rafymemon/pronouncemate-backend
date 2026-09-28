@@ -4,7 +4,7 @@ from django.contrib.auth.models import User
 from .models import PracticeSession, UserProfile, Script
 from .models import (
     PracticeSession, UserProfile, Script,
-    WordMastery, LevelProgressionStatus, FocusScript,
+    WordMastery, LevelProgressionStatus, FocusScript, Notification,
 )
 
 
@@ -35,6 +35,7 @@ class UserProfileSerializer(serializers.ModelSerializer):
                   'voice_feedback', 'daily_reminders', 'auto_save_recordings',
                   'total_sessions', 'best_score']
 
+
 class ScriptSerializer(serializers.ModelSerializer):
     word_count = serializers.SerializerMethodField()
     preview    = serializers.SerializerMethodField()
@@ -56,9 +57,6 @@ class ScriptSerializer(serializers.ModelSerializer):
         return preview + '...' if len(words) > 18 else preview
 
 
-
-
-
 class RotatedScriptSerializer(serializers.ModelSerializer):
     word_count = serializers.SerializerMethodField()
     preview    = serializers.SerializerMethodField()
@@ -76,10 +74,6 @@ class RotatedScriptSerializer(serializers.ModelSerializer):
     def get_preview(self, obj):
         text = obj.content
         return text if len(text) <= 100 else text[:100] + '...'
-
-
-
-
 
 
 class WordMasterySerializer(serializers.ModelSerializer):
@@ -105,10 +99,6 @@ class LevelProgressionStatusSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
     def get_gates(self, obj):
-        """
-        Individual pass/fail per criterion, for the "X / 5 criteria met"
-        transparency panel on the dashboard (Improvement Phase doc, Section 2).
-        """
         from .progression import (
             GATE_MIN_AVG_SCORE, GATE_MAX_ERROR_RATE,
             GATE_MIN_MASTERY_PCT, GATE_MAX_PHONEME_PCT, GATE_MIN_SESSIONS,
@@ -153,4 +143,11 @@ class FocusScriptSerializer(serializers.ModelSerializer):
             'id', 'generated_at', 'source_words', 'regression_words', 'script_text',
             'completed', 'completed_at', 'pre_error_rate', 'post_error_rate',
         ]
+        read_only_fields = fields
+
+
+class NotificationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Notification
+        fields = ['id', 'notif_type', 'title', 'message', 'is_read', 'created_at']
         read_only_fields = fields

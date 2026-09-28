@@ -35,6 +35,9 @@ from .views import (
     LatestFocusScriptView,
     CompleteFocusScriptView,
     FocusScriptStatsView,
+
+    NotificationListView,
+    MarkNotificationsReadView,
 )
 
 urlpatterns = [
@@ -75,5 +78,10 @@ urlpatterns = [
     path('focus-scripts/latest/', LatestFocusScriptView.as_view(), name='focus-script-latest'),
     path('focus-scripts/stats/', FocusScriptStatsView.as_view(), name='focus-script-stats'),
     path('focus-scripts/<int:script_id>/complete/', CompleteFocusScriptView.as_view(), name='focus-script-complete'),
-    path('focus-scripts/', FocusScriptListView.as_view(), name='focus-script-list')
+    path('focus-scripts/', FocusScriptListView.as_view(), name='focus-script-list'),
+
+
+    # ... inside urlpatterns:
+    path('notifications/', NotificationListView.as_view(), name='notifications'),
+    path('notifications/read/', MarkNotificationsReadView.as_view(), name='notifications-read'),
 ]

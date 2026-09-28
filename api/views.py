@@ -10,8 +10,11 @@ from rest_framework.authtoken.models import Token
 from django.contrib.auth import authenticate
 from django.conf import settings
 from torch.profiler import profile
-from .models import PracticeSession, PhonemeError, UserProfile, Script, LEVEL_CHOICES
-from .serializers import RegisterSerializer, SessionSerializer, UserProfileSerializer, ScriptSerializer
+from .models import PracticeSession, PhonemeError, UserProfile, Script, LEVEL_CHOICES, Notification
+from .serializers import (
+    RegisterSerializer, SessionSerializer, UserProfileSerializer,
+    ScriptSerializer, NotificationSerializer,
+)
 from Pipeline.pipeline import run_pipeline
 from django.contrib.auth.models import User
 
@@ -22,6 +25,7 @@ from rest_framework.decorators import api_view, permission_classes
 
 from .rotation import get_rotated_scripts
 from . import gemini_service
+from . import notifications as notif
 from .serializers import RotatedScriptSerializer
 from .progression import (
     log_session_errors, update_word_mastery,
@@ -178,14 +182,24 @@ class AnalyzeView(APIView):
             profile.save()
 
             # ── Improvement Phase hooks ──────────────────────────────
+            focus_script_obj = None
             try:
                 word_results = result.get('words', [])
                 log_session_errors(session, request.user, word_results)
                 update_word_mastery(request.user, word_results)
                 evaluate_progression(request.user)  # flags eligibility only — user confirms the actual level-up
-                check_and_maybe_generate_focus_script(request.user)
+                focus_script_obj = check_and_maybe_generate_focus_script(request.user)
             except Exception:
                 logger.exception('Improvement Phase hooks failed (non-fatal)')
+
+            # ── Notifications: streak milestones + new Focus Script ──
+            # Own try block so a notification failure can never break the
+            # analysis response.
+            try:
+                notif.check_streak_notifications(request.user)
+                notif.notify_focus_script_ready(request.user, focus_script_obj)
+            except Exception:
+                logger.exception('Notification generation failed (non-fatal)')
 
             # ── Attach the Focus Script the Dashboard shows ──────────
             # Same query as LatestFocusScriptView (most recent uncompleted),
@@ -273,17 +287,6 @@ class PracticeMistakesView(APIView):
         original_session_id = request.data.get('original_session_id', '')
         mode = request.data.get('mode', 'sentences')
 
-        # FIX: this endpoint uses MultiPartParser (required for the audio
-        # file), which means every non-file field — including
-        # 'mistake_data' — arrives as a plain string, not parsed JSON.
-        # Flutter's submitPractice() correctly sends it as
-        # request.fields['mistake_data'] = jsonEncode(...) since multipart
-        # fields can only be strings, so we must decode it here ourselves
-        # instead of assuming request.data.get('mistake_data', []) is
-        # already a list of dicts. Previously this silently returned the
-        # raw JSON string, and `for md in mistake_data` iterated over its
-        # individual characters, each a 1-char str, causing
-        # `md.get('word', '')` to raise AttributeError.
         mistake_data_raw = request.data.get('mistake_data', '[]')
         if isinstance(mistake_data_raw, str):
             try:
@@ -294,8 +297,6 @@ class PracticeMistakesView(APIView):
                     status=400
                 )
         else:
-            # Already a list (e.g. if parser/content-type ever changes) —
-            # handle gracefully rather than assuming one shape forever.
             mistake_data = mistake_data_raw
 
         if not isinstance(mistake_data, list):
@@ -435,7 +436,6 @@ class ProfileView(APIView):
         user    = request.user
         profile = self._get_or_create_profile(user)
 
-        # ── Aggregate session stats ──────────────────────
         sessions = PracticeSession.objects.filter(user=user)
         total_sessions   = sessions.count()
         scores           = [s.accuracy for s in sessions if s.accuracy is not None]
@@ -469,26 +469,21 @@ class ProfileView(APIView):
         ).order_by('-count')[:5]
 
         return Response({
-            # Identity
             'username':    user.username,
             'email':       user.email,
             'first_name':  user.first_name,
             'member_since': user.date_joined.strftime('%B %Y'),
             'member_since_full': user.date_joined.isoformat(),
 
-            # Level
             'proficiency_level':    profile.proficiency_level,
             'computed_level':       computed_level,
             'level_reason':         self._level_reason(avg_accuracy, total_sessions),
 
-            # Settings — all four Profile-screen toggles now round-trip
-            # through the backend instead of resetting on every load.
             'voice_feedback':       profile.voice_feedback,
             'reference_accent':     profile.reference_accent,
             'daily_reminders':      profile.daily_reminders,
             'auto_save_recordings': profile.auto_save_recordings,
 
-            # Stats
             'total_sessions':  total_sessions,
             'avg_accuracy':    avg_accuracy,
             'best_score':      best_score,
@@ -499,7 +494,6 @@ class ProfileView(APIView):
             'favorite_mode':   favorite_mode.replace('_', ' ').title(),
             'weekly_accuracy': weekly_accuracy,
 
-            # Top errors
             'top_errors': [
             {'word': e['word'], 'count': e['count']}
             for e in top_errors
@@ -545,7 +539,6 @@ class ProfileView(APIView):
             profile.reference_accent = accent
             profile.save(update_fields=['reference_accent'])
 
-        # ── NEW: the two remaining toggles ──────────────────
         if 'daily_reminders' in data:
             value = data['daily_reminders']
             if not isinstance(value, bool):
@@ -617,6 +610,8 @@ class ProfileView(APIView):
 
         return streak
 
+
+
 class ScriptListView(APIView):
     permission_classes = [AllowAny]
 
@@ -645,6 +640,22 @@ class ScriptListView(APIView):
         })
 
 
+def _auto_level_from_word_count(word_count: int) -> str:
+    """
+    Assigns a difficulty level automatically from content length, used
+    when the caller doesn't supply one (see ScriptUploadView below —
+    currently only the "type or paste text" flow omits it; file uploads
+    still let the user pick explicitly via the level picker dialog).
+
+    Thresholds: beginner ≤ 60 words, intermediate 61-150, expert > 150.
+    """
+    if word_count <= 60:
+        return 'beginner'
+    if word_count <= 150:
+        return 'intermediate'
+    return 'expert'
+
+
 class ScriptUploadView(APIView):
     permission_classes = [IsAuthenticated]
     parser_classes     = [MultiPartParser, JSONParser]
@@ -652,7 +663,7 @@ class ScriptUploadView(APIView):
     def post(self, request):
         title   = request.data.get('title', '').strip()
         content = request.data.get('content', '').strip()
-        level   = request.data.get('level', 'intermediate')
+        level   = (request.data.get('level') or '').strip() or None
         mode    = request.data.get('mode', 'script_based')
         file    = request.FILES.get('file')
 
@@ -680,6 +691,13 @@ class ScriptUploadView(APIView):
                 {'error': 'Script must have at least 5 words'}, status=400
             )
 
+        # FIX: level is now optional. When the caller doesn't supply one
+        # (the "type or paste text" dialog no longer shows a difficulty
+        # picker), assign it automatically from word count instead of
+        # silently defaulting to 'intermediate' regardless of length.
+        if not level:
+            level = _auto_level_from_word_count(len(content.split()))
+
         script = Script.objects.create(
             title=title, level=level, mode=mode,
             content=content, is_builtin=False,
@@ -703,13 +721,6 @@ class GenerateScriptView(APIView):
     """
     POST /api/scripts/generate/
     Body: {"topic": str, "word_limit": int, "mode": str, "level": str}
-
-    Powers the "Generate with AI" button on the practice screen. Generates
-    a single custom script via Gemini from a user-supplied topic and word
-    limit, then saves it exactly like a manual upload — is_builtin=False,
-    uploaded_by=request.user — so it appears under "My Scripts" and
-    UserScriptProgress tracking works on it normally. Returns the same
-    shape as ScriptUploadView/ScriptListView.
     """
     permission_classes = [IsAuthenticated]
     parser_classes = [JSONParser]
@@ -792,10 +803,6 @@ def dashboard_summary(request):
         'score': float(s.accuracy),
         'grade': s.grade,
         'date_label': _format_date(s.created_at),
-        # FIX: was inferring mode by keyword-matching script content
-        # (_detect_mode), which guesses wrong whenever a script's wording
-        # doesn't match its assigned mode. Script.mode is the actual,
-        # authoritative field — use it directly.
         'mode': s.script.mode if s.script else 'script_based',
         'total_words': s.total_words,
         'flagged_words': s.flagged_words,
@@ -869,7 +876,6 @@ def progress_analytics(request):
         'accuracy': float(s.accuracy),
         'word_count': s.total_words,
         'duration_minutes': 0,
-        # FIX: same _detect_mode → Script.mode fix as dashboard_summary above.
         'mode': s.script.mode if s.script else 'script_based',
         'created_at': s.created_at.isoformat(),
     } for s in sessions]
@@ -937,14 +943,6 @@ def _calculate_streak(user):
 
 
 def _compute_weekly_accuracy(user, days=7):
-    """
-    Returns `days` entries (oldest -> newest, ending today), each with that
-    CALENDAR DAY's average PracticeSession accuracy and session count —
-    grouped via TruncDate + Avg, not just the last N raw session scores.
-    This is the source of truth for the Home screen's Weekly Activity
-    heatmap; computed fresh on every call so a session completed seconds
-    ago is already reflected.
-    """
     today = timezone.now().date()
     start_date = today - timedelta(days=days - 1)
 
@@ -1012,21 +1010,6 @@ def _calculate_improvement(sessions_qs):
 
 
 def _infer_mode_scores(sessions_qs):
-    """
-    Real per-mode average accuracy — computed by filtering sessions on
-    their actual Script.mode and averaging, one query per mode.
-
-    FIX: this previously faked all three numbers by taking the OVERALL
-    average and multiplying by an arbitrary 0.95 / 1.0 / 1.05 depending on
-    mode — so "Public Speaking" and "Daily Conversation" never reflected
-    real performance in that mode at all, just a cosmetic offset from the
-    same underlying number. Dashboard's Mode Performance gauge and
-    Analytics' Score by Mode card both read this.
-
-    A mode with zero sessions so far falls back to the overall average
-    (rather than 0) so the UI still shows a sane number instead of an
-    artificial "0% — needs more practice" for a mode nobody has tried yet.
-    """
     overall_avg = sessions_qs.aggregate(avg=Avg('accuracy'))['avg'] or 0
 
     result = {}
@@ -1042,15 +1025,6 @@ def _infer_mode_scores(sessions_qs):
 
 
 class ScriptRotationView(APIView):
-    """
-    GET /api/scripts/rotation/?mode=daily_conversation&level=intermediate&count=5
-
-    Returns a smart-rotated set of scripts for the logged-in user:
-    unpracticed scripts first, then the least-recently-practiced ones
-    once that pool is exhausted. mode and level are both optional —
-    omit both to rotate across the entire builtin library (used for the
-    home screen's "Today's Picks").
-    """
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
@@ -1061,7 +1035,7 @@ class ScriptRotationView(APIView):
             count = int(request.query_params.get('count', 5))
         except (TypeError, ValueError):
             count = 5
-        count = max(1, min(count, 20))  # sane bounds, avoid abuse
+        count = max(1, min(count, 20))
 
         if mode and mode not in dict(Script.MODE_CHOICES):
             return Response(
@@ -1084,11 +1058,6 @@ class ScriptRotationView(APIView):
 # ═══════════════════════════════════════════════════════════════
 
 class ProgressionStatusView(APIView):
-    """
-    GET /api/progression/
-    Returns the user's current level, rolling metrics, and per-gate
-    pass/fail breakdown for the progression transparency panel.
-    """
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
@@ -1097,11 +1066,6 @@ class ProgressionStatusView(APIView):
 
 
 class WordMasteryListView(APIView):
-    """
-    GET /api/mastery/?status=active|mastered
-    Returns the user's tracked words. Defaults to active (focus) words;
-    pass ?status=mastered to see the mastered list, or omit for all.
-    """
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
@@ -1113,14 +1077,6 @@ class WordMasteryListView(APIView):
 
 
 class FocusScriptListView(APIView):
-    """
-    GET /api/focus-scripts/
-    Returns the user's Focus Scripts, most recent first.
-
-    GET /api/focus-scripts/latest/
-    Returns only the most recent uncompleted one, for the dashboard
-    suggestion card — or {'focus_script': null} if there isn't one.
-    """
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
@@ -1143,11 +1099,6 @@ class LatestFocusScriptView(APIView):
 
 
 class CompleteFocusScriptView(APIView):
-    """
-    PATCH /api/focus-scripts/<id>/complete/
-    Marks a Focus Script as completed and records the post-remediation
-    error rate on its target words for the pre/post comparison metric.
-    """
     permission_classes = [IsAuthenticated]
 
     def patch(self, request, script_id):
@@ -1170,16 +1121,15 @@ class CompleteFocusScriptView(APIView):
 
 
 class ConfirmPromotionView(APIView):
-    """
-    POST /api/progression/confirm/
-    Applies the level-up if the user is currently eligible. Called when
-    the user accepts the "ready to level up?" prompt shown at session start.
-    """
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
         new_level = promote_if_eligible(request.user)
         if new_level:
+            try:
+                notif.notify_level_up(request.user, new_level)
+            except Exception:
+                logger.exception('Level-up notification failed (non-fatal)')
             return Response({'promoted': True, 'new_level': new_level})
         return Response(
             {'promoted': False, 'message': 'Not currently eligible for promotion'},
@@ -1188,11 +1138,6 @@ class ConfirmPromotionView(APIView):
 
 
 class FocusScriptStatsView(APIView):
-    """
-    GET /api/focus-scripts/stats/
-    Aggregate improvement stats across all completed Focus Scripts —
-    the pre/post remediation comparison metric for evaluation.
-    """
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
@@ -1223,3 +1168,37 @@ class FocusScriptStatsView(APIView):
             'avg_post_error_rate': round(avg_post, 1),
             'avg_improvement_pct': round(avg_improvement, 1),
         })
+
+
+# ═══════════════════════════════════════════════════════════════
+# NOTIFICATIONS
+# ═══════════════════════════════════════════════════════════════
+
+class NotificationListView(APIView):
+    """
+    GET /api/notifications/
+    Most recent 50 notifications for the user, plus an unread count for
+    the Home screen's bell badge.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        qs = Notification.objects.filter(user=request.user)[:50]
+        unread_count = Notification.objects.filter(user=request.user, is_read=False).count()
+        return Response({
+            'notifications': NotificationSerializer(qs, many=True).data,
+            'unread_count': unread_count,
+        })
+
+
+class MarkNotificationsReadView(APIView):
+    """
+    POST /api/notifications/read/
+    Marks all of the user's unread notifications as read. Called when the
+    notifications screen opens.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        Notification.objects.filter(user=request.user, is_read=False).update(is_read=True)
+        return Response({'message': 'Notifications marked as read'})
