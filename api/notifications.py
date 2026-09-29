@@ -86,6 +86,9 @@ def notify_focus_script_ready(user, focus_script) -> None:
         notif_type='focus_script',
         title='Focus Script Ready',
         message=f'A new practice script targeting {preview_words} is ready for you.',
+        # Lets the app open exactly this Focus Script when the
+        # notification is tapped.
+        related_id=focus_script.id,
     )
 
 

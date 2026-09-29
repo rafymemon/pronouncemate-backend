@@ -243,6 +243,13 @@ class Notification(models.Model):
     is_read    = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
 
+    # NEW: id of the object this notification is about (currently the
+    # FocusScript id for 'focus_script' notifications). Deliberately a
+    # plain integer, not a ForeignKey — deleting the target must not
+    # delete the notification, and the app handles "target gone" itself.
+    # Null for older rows and for types with no specific target.
+    related_id = models.IntegerField(null=True, blank=True)
+
     class Meta:
         ordering = ['-created_at']
 

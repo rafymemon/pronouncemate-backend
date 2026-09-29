@@ -1228,3 +1228,21 @@ class MarkNotificationsReadView(APIView):
     def post(self, request):
         Notification.objects.filter(user=request.user, is_read=False).update(is_read=True)
         return Response({'message': 'Notifications marked as read'})
+
+
+class NotificationDeleteView(APIView):
+    """
+    DELETE /api/notifications/<id>/
+    Removes one of the user's own notifications (swipe-to-dismiss in the
+    notifications feed). Scoped to request.user so nobody can delete
+    someone else's notification by guessing an id.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def delete(self, request, notification_id):
+        deleted, _ = Notification.objects.filter(
+            id=notification_id, user=request.user
+        ).delete()
+        if not deleted:
+            return Response({'error': 'Notification not found'}, status=404)
+        return Response({'message': 'Notification deleted'})

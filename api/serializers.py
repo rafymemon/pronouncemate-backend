@@ -149,5 +149,6 @@ class FocusScriptSerializer(serializers.ModelSerializer):
 class NotificationSerializer(serializers.ModelSerializer):
     class Meta:
         model = Notification
-        fields = ['id', 'notif_type', 'title', 'message', 'is_read', 'created_at']
+        fields = ['id', 'notif_type', 'title', 'message', 'is_read',
+                  'created_at', 'related_id']
         read_only_fields = fields
