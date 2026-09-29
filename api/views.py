@@ -1,15 +1,13 @@
 # api/views.py
 import os, tempfile, logging, json, uuid
-from av import data
 from rest_framework.views      import APIView
 from rest_framework.response   import Response
 from rest_framework.parsers    import MultiPartParser, JSONParser
-from rest_framework import request, status
+from rest_framework import status
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.authtoken.models import Token
 from django.contrib.auth import authenticate
 from django.conf import settings
-from torch.profiler import profile
 from .models import PracticeSession, PhonemeError, UserProfile, Script, LEVEL_CHOICES, Notification
 from .serializers import (
     RegisterSerializer, SessionSerializer, UserProfileSerializer,
@@ -18,7 +16,8 @@ from .serializers import (
 from Pipeline.pipeline import run_pipeline
 from django.contrib.auth.models import User
 
-from django.db.models import Avg, Count, Max, F, Sum
+from django.db.models import Avg, Count, Max, F, Sum, Value
+from django.db.models.functions import Coalesce
 from django.utils import timezone
 from datetime import timedelta
 from rest_framework.decorators import api_view, permission_classes
@@ -425,8 +424,18 @@ class SessionHistoryView(APIView):
             except (TypeError, ValueError):
                 pass  # malformed ?days= -> fall back to unfiltered, capped list
 
-        sessions = sessions.order_by('-created_at')[:50]
-        return Response(SessionSerializer(sessions, many=True).data)
+        sessions = list(sessions.order_by('-created_at')[:50])
+        serialized = SessionSerializer(sessions, many=True).data
+
+        # Make sure every row carries `total_words` (the Home screen's
+        # "Words Practiced" sums it). setdefault keeps the serializer's own
+        # value if it already exposes the field.
+        payload = []
+        for session, item in zip(sessions, serialized):
+            row = dict(item)
+            row.setdefault('total_words', session.total_words)
+            payload.append(row)
+        return Response(payload)
 
 
 class ProfileView(APIView):
@@ -454,11 +463,18 @@ class ProfileView(APIView):
         streak = self._compute_streak(user)
         weekly_accuracy = _compute_weekly_accuracy(user)
 
-        from django.db.models import Count
-        mode_counts = sessions.values('script__mode').annotate(
+        # FIX: sessions saved without a Script (custom/pasted text, or a
+        # script_id that no longer exists) have script__mode = NULL, which
+        # used to make favorite_mode None and crash the .replace() below.
+        # Treat a missing script as 'script_based', matching what
+        # dashboard_summary and progress_analytics already do. 'None yet'
+        # is now only returned when the user has no sessions at all.
+        mode_counts = sessions.annotate(
+            mode_value=Coalesce('script__mode', Value('script_based'))
+        ).values('mode_value').annotate(
             count=Count('id')).order_by('-count')
         top_mode = mode_counts.first()
-        favorite_mode = top_mode['script__mode'] if top_mode else 'None yet'
+        favorite_mode = (top_mode['mode_value'] if top_mode else None) or 'None yet'
 
         top_errors = PhonemeError.objects.filter(
             session__user=user
@@ -942,9 +958,19 @@ def _calculate_streak(user):
     return streak
 
 
-def _compute_weekly_accuracy(user, days=7):
-    today = timezone.now().date()
-    start_date = today - timedelta(days=days - 1)
+def _current_week_start():
+    """Monday of the current calendar week (local date)."""
+    today = timezone.localdate() if settings.USE_TZ else timezone.now().date()
+    return today - timedelta(days=today.weekday())
+
+
+def _compute_weekly_accuracy(user):
+    """
+    Calendar-week heatmap data: Monday -> Sunday of the CURRENT week.
+    Resets to empty on Monday. Days that haven't happened yet are
+    returned with 0 sessions so the client always gets 7 entries.
+    """
+    start_date = _current_week_start()
 
     rows = (
         PracticeSession.objects
@@ -956,7 +982,7 @@ def _compute_weekly_accuracy(user, days=7):
     by_day = {row['day']: row for row in rows}
 
     result = []
-    for i in range(days):
+    for i in range(7):
         day = start_date + timedelta(days=i)
         row = by_day.get(day)
         result.append({
