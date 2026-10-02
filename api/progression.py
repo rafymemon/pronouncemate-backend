@@ -21,7 +21,8 @@ LEVEL_ORDER = ['beginner', 'intermediate', 'expert']
 
 MASTERY_REQUIRED_STREAK = 3
 FOCUS_SCRIPT_TRIGGER_THRESHOLD = 5
-FOCUS_SCRIPT_MAX_WORDS = 8
+FOCUS_SCRIPT_MAX_WORDS = None  # None = include every error word
+
 
 REGRESSION_CHECK_PROBABILITY = 0.1  # ~1-in-10, per design doc Section 3
 REGRESSION_MAX_WORDS = 2

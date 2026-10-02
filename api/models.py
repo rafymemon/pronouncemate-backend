@@ -221,6 +221,10 @@ class FocusScript(models.Model):
     pre_error_rate   = models.FloatField(null=True, blank=True)
     post_error_rate  = models.FloatField(null=True, blank=True)
 
+    # NEW: full before/after comparison saved when the Focus Script is
+    # completed (per-word status, counts, verdict). See api/focus_results.py.
+    result           = models.JSONField(null=True, blank=True)
+
 
 class Notification(models.Model):
     """

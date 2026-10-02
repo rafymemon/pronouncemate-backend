@@ -6,6 +6,7 @@ from .models import (
     PracticeSession, UserProfile, Script,
     WordMastery, LevelProgressionStatus, FocusScript, Notification,
 )
+from .focus_results import compute_baseline
 
 
 class RegisterSerializer(serializers.ModelSerializer):
@@ -137,13 +138,24 @@ class LevelProgressionStatusSerializer(serializers.ModelSerializer):
 
 
 class FocusScriptSerializer(serializers.ModelSerializer):
+    # NEW: how each target word was wrong before
+    # ([{word, error_type, error_count}, ...]).
+    baseline = serializers.SerializerMethodField()
+
     class Meta:
         model = FocusScript
         fields = [
             'id', 'generated_at', 'source_words', 'regression_words', 'script_text',
             'completed', 'completed_at', 'pre_error_rate', 'post_error_rate',
+            'baseline', 'result',
         ]
         read_only_fields = fields
+
+    def get_baseline(self, obj):
+        try:
+            return compute_baseline(obj)
+        except Exception:
+            return []
 
 
 class NotificationSerializer(serializers.ModelSerializer):

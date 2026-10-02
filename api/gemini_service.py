@@ -5,6 +5,8 @@ import logging
 from google import genai
 from google.genai import types
 from django.conf import settings
+import re
+import math
 
 logger = logging.getLogger(__name__)
 
@@ -43,21 +45,32 @@ def _get_client():
         )
     return _client
 
-
 def generate_focus_script_text(words: list[str], level: str, mode: str = 'daily_conversation') -> str:
     """
-    Generates a short practice script naturally embedding the given
-    target words, matched to the user's current level.
+    Generates a practice script that embeds ALL the given target words,
+    matched to the user's current level. Length scales with the number of
+    words, and any word Gemini misses is appended so none are lost.
     """
-    prompt = f"""You are generating a short English pronunciation practice script.
+    words = list(dict.fromkeys(
+        w.strip().lower() for w in words if w and w.strip()
+    ))
+    if not words:
+        return ''
 
-Target words to naturally embed (each should appear at least once): {", ".join(words)}
+    n = len(words)
+    sentence_target = max(4, math.ceil(n / 2))
+    max_tokens = min(4000, 400 + 40 * n)
+    timeout_ms = min(20_000, DEFAULT_TIMEOUT_MS + 300 * n)
+
+    prompt = f"""You are generating an English pronunciation practice script.
+
+Target words to naturally embed (EVERY one must appear at least once, spelled exactly as written): {", ".join(words)}
 Learner level: {level}
 Practice mode: {mode}
 
-Write a natural, coherent script (4-6 sentences) suitable for reading aloud,
-that includes all target words in context. Return ONLY the script text,
-no preamble or explanation."""
+Write a natural, coherent script of about {sentence_target} sentences suitable
+for reading aloud, that includes all {n} target words in context. Return ONLY
+the script text, no preamble, no numbering, no explanation."""
 
     try:
         client = _get_client()
@@ -65,16 +78,27 @@ no preamble or explanation."""
             model=MODEL_NAME,
             contents=prompt,
             config=types.GenerateContentConfig(
-                max_output_tokens=400,
+                max_output_tokens=max_tokens,
+                http_options=types.HttpOptions(
+                    timeout=timeout_ms,
+                    retry_options=types.HttpRetryOptions(attempts=DEFAULT_ATTEMPTS),
+                ),
             ),
         )
-        return response.text.strip()
+        text = response.text.strip()
+
+        # Safety net: make sure no error word was left out.
+        present = set(re.findall(r"[a-z']+", text.lower()))
+        missing = [w for w in words if w not in present]
+        if missing:
+            text += ' Now practice these words: ' + ', '.join(missing) + '.'
+        return text
     except Exception as e:
         logger.exception(f'Gemini Focus Script generation failed: {e}')
         # Graceful fallback so a Gemini outage never breaks session completion
         return 'Practice these words in your own sentences: ' + ', '.join(words) + '.'
 
-
+    
 def generate_rotation_scripts(mode: str, level: str, count: int = 1) -> list[dict]:
     """
     Generates `count` fresh, level-appropriate practice scripts for Smart

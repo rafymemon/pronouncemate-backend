@@ -33,13 +33,14 @@ from .views import (
     WordMasteryListView,
     FocusScriptListView,
     LatestFocusScriptView,
-    CompleteFocusScriptView,
     FocusScriptStatsView,
 
     NotificationListView,
     MarkNotificationsReadView,
     NotificationDeleteView,
 )
+# Focus Script before/after flow lives in its own module
+from .focus_views import FocusScriptDetailView, CompleteFocusScriptView
 
 urlpatterns = [
     # Auth
@@ -79,10 +80,9 @@ urlpatterns = [
     path('focus-scripts/latest/', LatestFocusScriptView.as_view(), name='focus-script-latest'),
     path('focus-scripts/stats/', FocusScriptStatsView.as_view(), name='focus-script-stats'),
     path('focus-scripts/<int:script_id>/complete/', CompleteFocusScriptView.as_view(), name='focus-script-complete'),
+    path('focus-scripts/<int:script_id>/', FocusScriptDetailView.as_view(), name='focus-script-detail'),
     path('focus-scripts/', FocusScriptListView.as_view(), name='focus-script-list'),
 
-
-    # ... inside urlpatterns:
     path('notifications/', NotificationListView.as_view(), name='notifications'),
     path('notifications/read/', MarkNotificationsReadView.as_view(), name='notifications-read'),
     path('notifications/<int:notification_id>/', NotificationDeleteView.as_view(), name='notification-delete'),
