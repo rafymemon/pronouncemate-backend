@@ -11,7 +11,7 @@ import logging
 from typing import List, Dict, Optional
 from dataclasses import dataclass
 
-from .pipeline import run_pipeline
+from .pipeline import run_pipeline, INCLUDE_MINOR_IN_PRACTICE
 from .scorer import calculate_score
 
 logger = logging.getLogger(__name__)
@@ -21,6 +21,13 @@ logger = logging.getLogger(__name__)
 MIN_WORDS_FOR_PRACTICE = 3
 MAX_WORDS_FOR_PRACTICE = 15
 PRACTICE_PASS_THRESHOLD = 85.0
+
+# Types that are NEVER a practiceable mistake, whatever the caller passes:
+#   correct  - nothing wrong
+#   accent   - forgiven Pakistani-accent variant (never penalized in scoring,
+#              so it must not come back as a "mistake" either)
+# 'minor' joins this set unless pipeline.INCLUDE_MINOR_IN_PRACTICE is True.
+_ALWAYS_EXCLUDED = ('correct', 'accent')
 
 
 @dataclass
@@ -44,14 +51,23 @@ def extract_mistake_words(errors: List[Dict],
                           exclude_types: tuple = ('inserted',)) -> List[MistakeWord]:
     """
     Extract words that were flagged from a session's error list.
+
+    'correct' and 'accent' are always excluded (accent variants are forgiven
+    in scoring, so they are not mistakes). 'minor' is excluded unless
+    pipeline.INCLUDE_MINOR_IN_PRACTICE is True. `exclude_types` adds to
+    these, it cannot remove them.
     """
+    excluded = set(_ALWAYS_EXCLUDED) | set(exclude_types or ())
+    if not INCLUDE_MINOR_IN_PRACTICE:
+        excluded.add('minor')
+
     mistakes = []
 
     for e in errors:
         err_type = e.get('type', '')
         severity = e.get('severity', 0)
 
-        if err_type == 'correct' or err_type in exclude_types:
+        if err_type in excluded:
             continue
 
         if severity < min_severity:

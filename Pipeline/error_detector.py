@@ -62,6 +62,18 @@ MIN_CLIP_DURATION = 0.15
 # on observed session data, not a derived constant.
 MINOR_DIST_THRESHOLD = 0.35
 
+# ── Acoustic confidence gates ─────────────────────────────────
+# Below ACOUSTIC_MIN_CONF the bucket is not used at all (unchanged).
+# Between MIN and TRUST the bucket may still CONFIRM a word (exact match /
+# accent match / variant match) but may NOT condemn it: a non-matching read
+# at that confidence is far more often wav2vec noise or neighbouring-word
+# leakage than a real mispronunciation (observed: 'my' conf 0.46 -> ['n','ə'],
+# 'during' conf 0.51, 'quick' conf 0.58 -> 'oɪ'), so the word goes to the
+# text fallback (Whisper transcript vs answer key) instead.
+# TUNABLE: raise to be stricter, lower to be stricter-on-acoustics.
+ACOUSTIC_MIN_CONF = 0.3
+ACOUSTIC_TRUST_CONF = 0.6
+
 # ── Boundary refinement (see refine_bucket_boundaries) ────────
 # Whisper's word timestamps are only accurate to a few tens of ms, and
 # short function words are often off by more than that. Because the
@@ -79,6 +91,134 @@ BOUNDARY_PASSES = 3         # max left-to-right sweeps over the utterance
 # path each word took. Flip to True when validating this change; leave
 # False otherwise.
 DEBUG_DETECTION = True
+
+
+# ── Phoneme canonicalization (acoustic / IPA branch ONLY) ─────
+# The reference comes from espeak (phonemizer); the prediction comes from
+# wav2vec2 fine-tuned on espeak labels. They use slightly different symbols
+# for the SAME sound, which used to be scored as substitutions. This map
+# folds those into one form. It is applied ONLY after the exact-match and
+# accent checks (which keep using plain normalize()), so it can never change
+# what accent_rules.py sees or reports.
+#
+#  notation only (same sound, different symbol):
+#     ᵻ ᵿ ɐ  oːɹ/oɹ/ɔɹ  ɚ ɝ  g  ɫ  r  ɜ ɑ
+#  dialect-standard (valid in British / Pakistani / Indian English):
+#     ɒ ɔ -> ɑː   (LOT vowel)       ɾ -> t   (flap allophone of /t/)
+_SYMBOL_EQUIV = {
+    'ᵻ': ['ɪ'], 'ᵿ': ['ʊ'], 'ɐ': ['ə'],
+    'oːɹ': ['ɔːɹ'], 'oɹ': ['ɔːɹ'], 'ɔɹ': ['ɔːɹ'],
+    'ɚ': ['ə', 'ɹ'], 'ɝ': ['ɜː', 'ɹ'],
+    'g': ['ɡ'], 'ɫ': ['l'], 'r': ['ɹ'],
+    'ɜ': ['ɜː'], 'ɑ': ['ɑː'],
+    'ɒ': ['ɑː'], 'ɔ': ['ɑː'],
+    'ɾ': ['t'],
+}
+
+
+def _canon(phonemes: list) -> list:
+    """normalize() + fold equivalent IPA symbols. IPA branch only."""
+    out: list = []
+    for p in normalize(phonemes):
+        out.extend(_SYMBOL_EQUIV.get(p, [p]))
+    return out
+
+
+def _norm_dist(a: list, b: list) -> float:
+    return Levenshtein.distance(a, b) / max(len(a), len(b), 1)
+
+
+# ── Alternative valid pronunciations ──────────────────────────
+# espeak gives ONE reference per word, but many words have several correct
+# pronunciations. A read is judged against the closest one.
+# Written as token lists in the same IPA alphabet as the model output; they
+# pass through _canon() so notation differences don't matter. Extend freely.
+
+# Weak/strong forms of function words. Natural English reduces these
+# ("to" -> /tə/), so reading them in the strong form OR the weak form is fine.
+FUNCTION_WORD_VARIANTS = {
+    'a':      [['ə'], ['eɪ']],
+    'an':     [['ə', 'n'], ['æ', 'n']],
+    'the':    [['ð', 'ə'], ['ð', 'ɪ'], ['ð', 'iː']],
+    'to':     [['t', 'ə'], ['t', 'ʊ'], ['t', 'uː']],
+    'of':     [['ə', 'v'], ['ʌ', 'v'], ['ɒ', 'v']],
+    'and':    [['ə', 'n', 'd'], ['ə', 'n'], ['æ', 'n', 'd'], ['æ', 'n']],
+    'for':    [['f', 'ə'], ['f', 'ɔːɹ'], ['f', 'ɔː']],
+    'from':   [['f', 'ɹ', 'ə', 'm'], ['f', 'ɹ', 'ʌ', 'm'], ['f', 'ɹ', 'ɒ', 'm']],
+    'at':     [['ə', 't'], ['æ', 't']],
+    'as':     [['ə', 'z'], ['æ', 'z']],
+    'that':   [['ð', 'ə', 't'], ['ð', 'æ', 't']],
+    'than':   [['ð', 'ə', 'n'], ['ð', 'æ', 'n']],
+    'can':    [['k', 'ə', 'n'], ['k', 'æ', 'n']],
+    'was':    [['w', 'ə', 'z'], ['w', 'ɒ', 'z'], ['w', 'ʌ', 'z']],
+    'were':   [['w', 'ə'], ['w', 'ə', 'ɹ'], ['w', 'ɜː']],
+    'have':   [['h', 'ə', 'v'], ['ə', 'v'], ['h', 'æ', 'v']],
+    'has':    [['h', 'ə', 'z'], ['ə', 'z'], ['h', 'æ', 'z']],
+    'had':    [['h', 'ə', 'd'], ['ə', 'd'], ['h', 'æ', 'd']],
+    'be':     [['b', 'ɪ'], ['b', 'iː']],
+    'been':   [['b', 'ɪ', 'n'], ['b', 'iː', 'n']],
+    'you':    [['j', 'ə'], ['j', 'ʊ'], ['j', 'uː']],
+    'your':   [['j', 'ə'], ['j', 'ɔːɹ'], ['j', 'ʊɹ']],
+    'he':     [['h', 'ɪ'], ['ɪ'], ['h', 'iː']],
+    'she':    [['ʃ', 'ɪ'], ['ʃ', 'iː']],
+    'her':    [['h', 'ə'], ['ə'], ['h', 'ɜː']],
+    'him':    [['ɪ', 'm'], ['h', 'ɪ', 'm']],
+    'his':    [['ɪ', 'z'], ['h', 'ɪ', 'z']],
+    'them':   [['ð', 'ə', 'm'], ['ð', 'ɛ', 'm']],
+    'us':     [['ə', 's'], ['ʌ', 's']],
+    'we':     [['w', 'ɪ'], ['w', 'iː']],
+    'but':    [['b', 'ə', 't'], ['b', 'ʌ', 't']],
+    'or':     [['ɔːɹ'], ['ə']],
+    'some':   [['s', 'ə', 'm'], ['s', 'ʌ', 'm']],
+    'would':  [['w', 'ə', 'd'], ['w', 'ʊ', 'd']],
+    'could':  [['k', 'ə', 'd'], ['k', 'ʊ', 'd']],
+    'should': [['ʃ', 'ə', 'd'], ['ʃ', 'ʊ', 'd']],
+    'will':   [['w', 'ɪ', 'l'], ['ə', 'l']],
+    'my':     [['m', 'aɪ'], ['m', 'ɪ'], ['m', 'ə']],
+    'with':   [['w', 'ɪ', 'ð'], ['w', 'ɪ', 'θ']],
+}
+
+# British / American (and other well-known) variants of content words.
+# Pakistani English follows British norms, so these matter for this app.
+WORD_VARIANTS = {
+    'schedule':   [['ʃ', 'ɛ', 'd', 'j', 'uː', 'l'], ['ʃ', 'ɛ', 'd', 'uː', 'l'],
+                   ['ʃ', 'ɛ', 'dʒ', 'uː', 'l'],
+                   ['s', 'k', 'ɛ', 'dʒ', 'uː', 'l'], ['s', 'k', 'ɛ', 'dʒ', 'ʊ', 'l']],
+    'ensure':     [['ɪ', 'n', 'ʃ', 'ɔːɹ'], ['ɛ', 'n', 'ʃ', 'ɔːɹ'],
+                   ['ɪ', 'n', 'ʃ', 'ʊɹ'], ['ɛ', 'n', 'ʃ', 'ʊɹ']],
+    'transition': [['t', 'ɹ', v, 'n', c, 'ɪ', s, 'ə', 'n']
+                   for v in ('æ', 'ɑː') for c in ('s', 'z') for s in ('ʃ', 'ʒ')],
+    'either':     [['aɪ', 'ð', 'ə'], ['iː', 'ð', 'ə'], ['aɪ', 'ð', 'ə', 'ɹ'], ['iː', 'ð', 'ə', 'ɹ']],
+    'neither':    [['n', 'aɪ', 'ð', 'ə'], ['n', 'iː', 'ð', 'ə'],
+                   ['n', 'aɪ', 'ð', 'ə', 'ɹ'], ['n', 'iː', 'ð', 'ə', 'ɹ']],
+    'privacy':    [['p', 'ɹ', 'ɪ', 'v', 'ə', 's', 'i'], ['p', 'ɹ', 'aɪ', 'v', 'ə', 's', 'i']],
+}
+
+_VARIANTS_CANON: Dict[str, List[list]] = {}
+for _w, _vs in list(FUNCTION_WORD_VARIANTS.items()) + list(WORD_VARIANTS.items()):
+    _VARIANTS_CANON.setdefault(_w, []).extend(_canon(v) for v in _vs)
+
+# Short function words whose acoustic bucket is often legitimately empty
+# (a ~50 ms schwa that CTC decoding simply doesn't emit). Whisper DID hear
+# them, so an empty bucket is not evidence of omission.
+_WEAK_WORDS = frozenset(FUNCTION_WORD_VARIANTS)
+
+
+# ── espeak reference cache ────────────────────────────────────
+# text_to_phonemes() is an espeak call per word and was re-run for every
+# distinct word of every session (it dominates detect_errors time). The
+# reference for a word never changes, so cache it for the process lifetime.
+_IPA_CACHE: Dict[str, tuple] = {}
+_IPA_CACHE_MAX = 20000
+
+
+def _ipa_cached(word: str) -> list:
+    hit = _IPA_CACHE.get(word)
+    if hit is None:
+        hit = tuple(text_to_phonemes(word) or [])
+        if len(_IPA_CACHE) < _IPA_CACHE_MAX:
+            _IPA_CACHE[word] = hit
+    return list(hit)
 
 
 def _find_prev_end(timings: list, i: int) -> Optional[float]:
@@ -124,8 +264,10 @@ def refine_bucket_boundaries(phoneme_lists: List[list],
     word i to the front of word i+1, and the first k phonemes of word i+1
     to the end of word i (k = 1..max_shift). A move is applied only if it
     STRICTLY lowers  dist(bucket_i, ref_i) + dist(bucket_i+1, ref_i+1),
-    where dist is the raw phoneme edit distance. Sweeps repeat (up to
-    max_passes) so a phoneme can travel across a short word in a chain.
+    where dist is the raw phoneme edit distance (computed on canonicalized
+    phonemes, so espeak-vs-wav2vec notation differences don't cause or
+    block moves). Sweeps repeat (up to max_passes) so a phoneme can travel
+    across a short word in a chain.
 
     Only bucket edges are ever touched and only when a neighbour's reference
     explains the phonemes better, so a phoneme that genuinely belongs to a
@@ -146,11 +288,11 @@ def refine_bucket_boundaries(phoneme_lists: List[list],
     """
     P = [list(p) for p in phoneme_lists]
     C = list(confs)
-    R = [normalize(r) for r in ref_lists]
+    R = [_canon(r) for r in ref_lists]
     moves: List[tuple] = []
 
     def cost(pred: list, idx: int) -> int:
-        return Levenshtein.distance(normalize(pred), R[idx])
+        return Levenshtein.distance(_canon(pred), R[idx])
 
     for _ in range(max_passes):
         changed = False
@@ -202,6 +344,115 @@ def refine_bucket_boundaries(phoneme_lists: List[list],
     return P, C, moves
 
 
+# ── Acoustic classification of ONE word ───────────────────────
+def _classify_acoustic(script_word: str, ref_phon_ipa: list, pred_phon_ipa: list,
+                       avg_conf: float, allow_negative: bool = True) -> Optional[dict]:
+    """
+    Judge one word from its wav2vec phoneme bucket.
+
+    Order (each step only runs if the previous one didn't decide):
+      1. exact match on plain-normalized phonemes            -> correct
+      2. Pakistani-accent pattern (accent_rules.py, plain)   -> accent
+      3. exact match after canonicalization against the
+         primary reference OR any alternative valid
+         pronunciation (FUNCTION_WORD_VARIANTS / WORD_VARIANTS) -> correct
+      4. confidence gate: below ACOUSTIC_TRUST_CONF a
+         non-matching read is not trusted                    -> None
+      5. classify from edit operations vs the CLOSEST
+         reference, downgrade to 'minor' if close            -> substitution / omission /
+                                                                insertion / minor
+
+    Returns None when the acoustic evidence can't decide (empty bucket, too
+    low confidence, or — with allow_negative=False — no positive verdict).
+    The caller then falls back to the text path (or leaves a skipped word
+    skipped).
+    """
+    if not pred_phon_ipa or avg_conf < ACOUSTIC_MIN_CONF:
+        return None
+
+    ref_plain = normalize(ref_phon_ipa)
+    pred_plain = normalize(pred_phon_ipa)
+    plain_dist = _norm_dist(ref_plain, pred_plain)
+
+    if DEBUG_DETECTION:
+        print(f"[DEBUG]   ref={ref_plain} pred={pred_plain}")
+
+    # 1. exact
+    if plain_dist < 0.001:
+        if DEBUG_DETECTION:
+            print(f"[DEBUG]   -> CORRECT (exact acoustic match)")
+        return {
+            'word': script_word,
+            'type': 'correct',
+            'severity': 0,
+            'ref_phon': ref_phon_ipa,
+            'pred_phon': pred_phon_ipa,
+            'ref_phon_norm': ref_plain,
+            'pred_phon_norm': pred_plain,
+            'per_word_score': 100.0
+        }
+
+    # 2. accent (always against PLAIN normalized phonemes, as before)
+    accent_match = check_accent_pattern(ref_plain, pred_plain)
+    if accent_match:
+        if DEBUG_DETECTION:
+            print(f"[DEBUG]   -> ACCENT ({accent_match}), dist={plain_dist:.3f}")
+        return {
+            'word': script_word,
+            'type': 'accent',
+            'severity': SEVERITY['accent'],
+            'ref_phon': ref_phon_ipa,
+            'pred_phon': pred_phon_ipa,
+            'ref_phon_norm': ref_plain,
+            'pred_phon_norm': pred_plain,
+            'accent_pattern': accent_match,
+            'per_word_score': accent_score(plain_dist)
+        }
+
+    # 3. canonical / alternative-pronunciation match
+    pred_canon = _canon(pred_phon_ipa)
+    candidates = [_canon(ref_phon_ipa)] + _VARIANTS_CANON.get(script_word.lower().strip(), [])
+    best_ref, best_dist = min(
+        ((c, _norm_dist(c, pred_canon)) for c in candidates),
+        key=lambda cd: cd[1]
+    )
+
+    if best_dist < 0.001:
+        if DEBUG_DETECTION:
+            print(f"[DEBUG]   -> CORRECT (equivalent symbols / valid variant) ref_used={best_ref}")
+        return {
+            'word': script_word,
+            'type': 'correct',
+            'severity': 0,
+            'ref_phon': ref_phon_ipa,
+            'pred_phon': pred_phon_ipa,
+            'ref_phon_norm': best_ref,
+            'pred_phon_norm': pred_canon,
+            'variant_match': True,
+            'per_word_score': 100.0
+        }
+
+    if not allow_negative:
+        return None
+
+    # 4. confidence gate — confirm freely, condemn only when confident
+    if avg_conf < ACOUSTIC_TRUST_CONF:
+        if DEBUG_DETECTION:
+            print(f"[DEBUG]   -> low confidence ({avg_conf:.3f}) and no match; "
+                  f"not trusting acoustic verdict")
+        return None
+
+    # 5. genuine difference
+    ops = Levenshtein.editops(best_ref, pred_canon)
+    error_type = classify_ops(ops, best_ref, pred_canon)
+    error_type = _maybe_downgrade_to_minor(error_type, best_dist)
+    if DEBUG_DETECTION:
+        print(f"[DEBUG]   -> {error_type.upper()} (no accent match), "
+              f"dist={best_dist:.3f}, ops={ops}, ref_used={best_ref}")
+    return build_result(script_word, error_type, ref_phon_ipa, pred_phon_ipa,
+                        best_dist, ref_norm=best_ref, pred_norm=pred_canon)
+
+
 # ── Main Detection ────────────────────────────────────────────
 def detect_errors(alignment: list, audio: np.ndarray, sr: int = 16000,
                   answer_key: dict = None, script_text: str = None) -> list:
@@ -219,14 +470,23 @@ def detect_errors(alignment: list, audio: np.ndarray, sr: int = 16000,
          Only a clean match against the forgiven pattern list is scored
          as 'accent'; anything else — including the flagged f/p case —
          falls through to normal classification.
-      3. If it's not an accent match either, classify from editops, then
+      3. Then compare against ALL valid pronunciations of the word
+         (symbol-equivalence + weak forms + British/American variants).
+      4. If it's still not a match, classify from editops, then
          downgrade to 'minor' if the phoneme distance is small enough
          that this was a close read rather than a genuinely wrong word
-         (see MINOR_DIST_THRESHOLD).
-      4. Fall back to the text-level G2P/CMU comparison only when the
+         (see MINOR_DIST_THRESHOLD). Low-confidence reads are never used
+         to condemn a word (see ACOUSTIC_TRUST_CONF).
+      5. Fall back to the text-level G2P/CMU comparison only when the
          word's timing is unusable (too short, missing) or the bucket
          came back empty/low-confidence. Same accent- and minor-downgrade
          logic applies there too.
+
+    SKIPPED words: a word Whisper dropped (e.g. very short 'I', 'it') has no
+    timing, but boundary refinement may still have moved the matching
+    phonemes into its bucket. If that bucket matches the word, the word was
+    spoken and is returned as correct/accent with 'recovered': True instead
+    of 'skipped'.
 
     METHODOLOGY NOTE — continuous decode + bucketing, not per-word slicing:
     Earlier versions of this pipeline sliced a separate audio clip per
@@ -264,21 +524,14 @@ def detect_errors(alignment: list, audio: np.ndarray, sr: int = 16000,
       answer_key/CMU (ARPAbet-vs-ARPAbet, internally consistent) since
       it never touches Wav2Vec2 output. The accent-tolerance check runs
       in BOTH branches, but always against phonemes in that branch's own
-      alphabet — never mixed.
+      alphabet — never mixed. Canonicalization (_canon) is IPA-only.
     """
     if answer_key is None and script_text is not None:
         answer_key = build_answer_key(script_text)
     if answer_key is None:
         raise ValueError("Must provide either answer_key or script_text")
 
-    # Per-call cache: the same word ("i", "and", "am") recurs many times in
-    # a script and espeak only needs to be asked once per distinct word.
-    _ipa_cache: Dict[str, list] = {}
-
-    def _ipa(word: str) -> list:
-        if word not in _ipa_cache:
-            _ipa_cache[word] = text_to_phonemes(word)
-        return _ipa_cache[word]
+    _ipa = _ipa_cached
 
     # Precompute (start, end) or None for every alignment position, so
     # each word can look up its actual timing — skipped/inserted entries
@@ -344,12 +597,40 @@ def detect_errors(alignment: list, audio: np.ndarray, sr: int = 16000,
             # failure fall back to the raw timestamp buckets.
             print(f"Warning: boundary refinement failed, using raw buckets: {e}")
 
+    def _bucket(i: int) -> Tuple[list, float]:
+        if i < len(word_phoneme_buckets):
+            b = word_phoneme_buckets[i]
+            if b:
+                return list(b.get('phonemes') or []), float(b.get('avg_confidence') or 0.0)
+        return [], 0.0
+
     results = []
 
     for i, (spoken_info, script_word) in enumerate(alignment):
 
         # ── Skipped word ──
         if spoken_info is None:
+            # Whisper dropped this word, but boundary refinement may have
+            # moved its phonemes into the (otherwise empty) bucket. Only a
+            # POSITIVE acoustic verdict rescues it — a partial/garbled
+            # bucket still counts as skipped.
+            recovered = None
+            if script_word:
+                pred_b, conf_b = _bucket(i)
+                if pred_b:
+                    if DEBUG_DETECTION:
+                        print(f"[DEBUG] '{script_word}': no spoken word aligned, "
+                              f"checking refined bucket {pred_b} conf={conf_b:.3f}")
+                    recovered = _classify_acoustic(script_word, _ipa(script_word),
+                                                   pred_b, conf_b, allow_negative=False)
+            if recovered is not None:
+                recovered['recovered'] = True
+                if DEBUG_DETECTION:
+                    print(f"[DEBUG]   -> RECOVERED from acoustic evidence "
+                          f"(Whisper dropped it, but it was spoken)")
+                results.append(recovered)
+                continue
+
             if DEBUG_DETECTION:
                 print(f"[DEBUG] '{script_word}': SKIPPED (no spoken word aligned)")
             results.append({
@@ -396,9 +677,7 @@ def detect_errors(alignment: list, audio: np.ndarray, sr: int = 16000,
         clip_duration = end - start
         timing_usable = clip_duration >= MIN_CLIP_DURATION and start < end
 
-        bucket = word_phoneme_buckets[i]
-        pred_phon_ipa = bucket['phonemes']
-        avg_conf = bucket['avg_confidence']
+        pred_phon_ipa, avg_conf = _bucket(i)
 
         if DEBUG_DETECTION:
             print(f"[DEBUG] '{script_word}': spoken='{spoken_word}' "
@@ -410,64 +689,24 @@ def detect_errors(alignment: list, audio: np.ndarray, sr: int = 16000,
             # IPA reference for THIS branch only — never mix with the
             # ARPAbet ref_phon/ref_norm computed above.
             ref_phon_ipa = _ipa(script_word)
-            ref_norm_ipa = normalize(ref_phon_ipa)
 
-            if pred_phon_ipa and avg_conf >= 0.3:
-                pred_norm = normalize(pred_phon_ipa)
-                dist_l2 = Levenshtein.distance(ref_norm_ipa, pred_norm)
-                max_len_l2 = max(len(ref_norm_ipa), len(pred_norm), 1)
-                norm_dist_l2 = dist_l2 / max_len_l2
-
-                if norm_dist_l2 < 0.001:
-                    if DEBUG_DETECTION:
-                        print(f"[DEBUG]   -> CORRECT (exact acoustic match)")
-                    acoustic_result = {
-                        'word': script_word,
-                        'type': 'correct',
-                        'severity': 0,
-                        'ref_phon': ref_phon_ipa,
-                        'pred_phon': pred_phon_ipa,
-                        'ref_phon_norm': ref_norm_ipa,
-                        'pred_phon_norm': pred_norm,
-                        'per_word_score': 100.0
-                    }
-                else:
-                    accent_match = check_accent_pattern(ref_norm_ipa, pred_norm)
-                    if accent_match:
-                        if DEBUG_DETECTION:
-                            print(f"[DEBUG]   -> ACCENT ({accent_match}), dist={norm_dist_l2:.3f}")
-                        acoustic_result = {
-                            'word': script_word,
-                            'type': 'accent',
-                            'severity': SEVERITY['accent'],
-                            'ref_phon': ref_phon_ipa,
-                            'pred_phon': pred_phon_ipa,
-                            'ref_phon_norm': ref_norm_ipa,
-                            'pred_phon_norm': pred_norm,
-                            'accent_pattern': accent_match,
-                            'per_word_score': accent_score(norm_dist_l2)
-                        }
-                    else:
-                        ops = Levenshtein.editops(ref_norm_ipa, pred_norm)
-                        error_type = classify_ops(ops, ref_norm_ipa, pred_norm)
-                        error_type = _maybe_downgrade_to_minor(error_type, norm_dist_l2)
-                        if DEBUG_DETECTION:
-                            print(f"[DEBUG]   -> {error_type.upper()} (no accent match), "
-                                  f"dist={norm_dist_l2:.3f}, ops={ops}")
-                        acoustic_result = build_result(script_word, error_type, ref_phon_ipa,
-                                                        pred_phon_ipa, norm_dist_l2)
-            elif pred_phon_ipa == [] or pred_phon_ipa is None:
+            if pred_phon_ipa:
+                acoustic_result = _classify_acoustic(script_word, ref_phon_ipa,
+                                                     pred_phon_ipa, avg_conf)
+                # None => too low confidence / untrusted: fall through to
+                # the text-based fallback below.
+            elif script_word.lower().strip() in _WEAK_WORDS:
+                # Short function word with an empty bucket: Whisper heard
+                # it, CTC just didn't emit a ~50ms schwa. Not an omission.
+                if DEBUG_DETECTION:
+                    print(f"[DEBUG]   -> empty bucket on weak word, using text fallback")
+            else:
                 # Bucket came back empty — no phonemes from the utterance
                 # decode landed in this word's time range at all.
                 if DEBUG_DETECTION:
                     print(f"[DEBUG]   -> OMISSION (empty bucket)")
                 acoustic_result = build_result(script_word, 'omission', ref_phon_ipa,
                                                 [], 1.0)
-            elif DEBUG_DETECTION:
-                print(f"[DEBUG]   -> low confidence ({avg_conf:.3f}), falling through to text fallback")
-            # else: low confidence but non-empty bucket — fall through to
-            # the text-based fallback below rather than trusting a
-            # low-confidence acoustic read.
 
         if acoustic_result is not None:
             results.append(acoustic_result)
@@ -636,10 +875,21 @@ def per_word_score_from_lists(ref: list, pred: list) -> float:
 
 
 def build_result(word: str, error_type: str, ref_phon: list,
-                 pred_phon: list, norm_dist: float) -> dict:
-    """Build the standard result dict for one word."""
-    ref_norm = normalize(ref_phon)
-    pred_norm = normalize(pred_phon)
+                 pred_phon: list, norm_dist: float,
+                 ref_norm: Optional[list] = None,
+                 pred_norm: Optional[list] = None) -> dict:
+    """
+    Build the standard result dict for one word.
+
+    ref_norm / pred_norm let the acoustic branch pass its canonicalized
+    (closest-variant) lists so editops, severity and per_word_score are all
+    computed on the same lists the verdict was based on. When omitted they
+    default to plain normalize(), exactly as before (text-fallback branch).
+    """
+    if ref_norm is None:
+        ref_norm = normalize(ref_phon)
+    if pred_norm is None:
+        pred_norm = normalize(pred_phon)
     ops = Levenshtein.editops(ref_norm, pred_norm)
     severity = assign_severity(error_type, ops)
 

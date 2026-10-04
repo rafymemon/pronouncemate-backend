@@ -4,6 +4,7 @@ import json
 import logging
 import time
 import numpy as np
+from Levenshtein import ratio as _lev_ratio
 from channels.generic.websocket import AsyncWebsocketConsumer
 from asgiref.sync import sync_to_async
 
@@ -15,6 +16,7 @@ SILENCE_RMS_THRESHOLD = 500
 SILENCE_CHUNKS_TO_CLOSE_WORD = 2
 MIN_VOICED_BYTES = 3200
 LOOKAHEAD = 3
+LOOKBACK = 2   # how far back a late/repeated word may still "heal" an earlier guess
 
 # Force-close a segment even without silence once the buffer holds this
 # much audio, so continuous fluent speech still gets periodic live
@@ -23,6 +25,24 @@ SAMPLE_RATE = 16000
 BYTES_PER_SAMPLE = 2
 MAX_BUFFER_SECONDS = 2.5
 MAX_BUFFER_BYTES = int(SAMPLE_RATE * BYTES_PER_SAMPLE * MAX_BUFFER_SECONDS)
+
+# Live statuses sent to Flutter:
+#   correct - tiny.en heard the expected word
+#   skipped - tiny.en jumped over a content word (user may really have skipped it)
+#   unsure  - tiny.en could not confirm the word (ASR noise, a dropped short
+#             function word, a mishear). NOT a verdict: the final /api/analyze/
+#             pass (small.en + wav2vec) always has the last word. Flutter shows
+#             it neutral/amber instead of red.
+# There is intentionally no live 'error': tiny.en text alone is not reliable
+# enough to call a pronunciation wrong.
+
+# Short words tiny.en routinely drops or merges; a gap here is 'unsure',
+# never 'skipped'.
+_WEAK_WORDS = frozenset({
+    'a', 'an', 'the', 'to', 'of', 'and', 'or', 'but', 'for', 'from', 'at', 'as',
+    'in', 'on', 'is', 'it', 'its', 'i', 'my', 'me', 'we', 'he', 'she', 'you',
+    'us', 'be', 'was', 'are', 'that', 'with', 'than', 'so', 'if', 'do', 'am',
+})
 
 
 def _pcm16_to_float32(pcm_bytes: bytes) -> np.ndarray:
@@ -41,6 +61,22 @@ def _clean_word(w: str) -> str:
     return ''.join(c for c in w.lower() if c.isalnum())
 
 
+def _words_match(heard: str, expected: str) -> bool:
+    """
+    Lenient live match: exact after cleaning, or (for words of 4+ letters)
+    a near-identical spelling — tiny.en often returns plural/tense variants
+    or small spelling slips ('schedual', 'meetings') for a correctly read word.
+    """
+    h, e = _clean_word(heard), _clean_word(expected)
+    if not h or not e:
+        return False
+    if h == e:
+        return True
+    if len(h) >= 4 and len(e) >= 4 and _lev_ratio(h, e) >= 0.8:
+        return True
+    return False
+
+
 class PracticeConsumer(AsyncWebsocketConsumer):
     async def connect(self):
         await self.accept()
@@ -50,6 +86,7 @@ class PracticeConsumer(AsyncWebsocketConsumer):
         self.silence_streak = 0
         self.initialized = False
         self._chunk_count = 0
+        self.statuses = {}
         print("🎤 [WS] Client connected")
 
     async def disconnect(self, close_code):
@@ -76,6 +113,7 @@ class PracticeConsumer(AsyncWebsocketConsumer):
             self.word_index = 0
             self.voice_buffer = bytearray()
             self.silence_streak = 0
+            self.statuses = {}
             self.initialized = True
             print(f"🎤 [WS] Initialized with {len(self.expected_words)} words")
             await self.send(text_data=json.dumps({
@@ -129,10 +167,13 @@ class PracticeConsumer(AsyncWebsocketConsumer):
             elapsed = time.monotonic() - t0
             print(f"🎤 [WS] transcribe_live() took {elapsed:.2f}s for {len(pcm_bytes)}B")
 
+        print(f"🎤 [WS] heard={heard_words}")
+
         if not heard_words:
-            if self.word_index < len(self.expected_words):
-                await self._emit(self.word_index, 'error')
-                self.word_index += 1
+            # Nothing intelligible in this segment (noise / breath). Do NOT
+            # advance: the old code painted the next expected word red and
+            # moved on, which desynced the pointer from where the user
+            # actually was and caused long red cascades.
             return
 
         for hw in heard_words:
@@ -140,28 +181,55 @@ class PracticeConsumer(AsyncWebsocketConsumer):
                 break
             await self._process_heard_word(hw)
 
-    async def _process_heard_word(self, heard_word: str):
-        clean_heard = _clean_word(heard_word)
+    def _gap_status(self, idx: int) -> str:
+        """Status for an expected word the live ASR jumped over."""
+        if _clean_word(self.expected_words[idx]) in _WEAK_WORDS:
+            return 'unsure'
+        return 'skipped'
 
-        if clean_heard == _clean_word(self.expected_words[self.word_index]):
+    async def _process_heard_word(self, heard_word: str):
+        if not _clean_word(heard_word):
+            return
+
+        # 1) Heard the word we were waiting for.
+        if _words_match(heard_word, self.expected_words[self.word_index]):
             await self._emit(self.word_index, 'correct')
             self.word_index += 1
             return
 
+        # 2) Heard a word a little further ahead: the words in between were
+        #    dropped by the ASR (short function words) or genuinely skipped.
         for offset in range(1, LOOKAHEAD + 1):
             idx = self.word_index + offset
-            if idx < len(self.expected_words) and clean_heard == _clean_word(self.expected_words[idx]):
+            if idx < len(self.expected_words) and _words_match(heard_word, self.expected_words[idx]):
                 for skip_i in range(self.word_index, idx):
-                    await self._emit(skip_i, 'skipped')
+                    await self._emit(skip_i, self._gap_status(skip_i))
                 await self._emit(idx, 'correct')
                 self.word_index = idx + 1
                 return
 
-        await self._emit(self.word_index, 'error')
+        # 3) Heard a word we already gave up on (an earlier 'unsure'/'skipped'
+        #    word arriving late, or an extra word that had pushed the pointer
+        #    forward). Heal it and DON'T advance — this is what stops one
+        #    stray word from turning the rest of the sentence red.
+        for back in range(1, LOOKBACK + 1):
+            j = self.word_index - back
+            if j < 0:
+                break
+            if (self.statuses.get(j) in ('unsure', 'skipped')
+                    and _words_match(heard_word, self.expected_words[j])):
+                await self._emit(j, 'correct')
+                return
+
+        # 4) Unmatched: ASR noise or a mishear. Mark the current word
+        #    'unsure' (neutral), move on, and let steps 2-3 resync on the
+        #    next heard word.
+        await self._emit(self.word_index, 'unsure')
         self.word_index += 1
 
     async def _emit(self, word_index: int, status: str):
         expected = self.expected_words[word_index]
+        self.statuses[word_index] = status
         print(f"🎤 [WS] word_index={word_index} expected='{expected}' status={status}")
         await self.send(text_data=json.dumps({
             'type': 'word_result',

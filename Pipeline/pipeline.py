@@ -17,6 +17,16 @@ logger = logging.getLogger(__name__)
 MIN_AUDIO_DURATION = 0.5   # seconds — reject if too short
 MAX_AUDIO_DURATION = 300.0  # seconds — 5 minutes max
 
+# 'minor' = a close-but-not-exact read (see error_detector.MINOR_DIST_THRESHOLD).
+# MINOR_COUNTS_AS_CORRECT: if True, minor words are counted as correct in the
+#   headline tallies (stats.correct_words / wrong_words / word_accuracy), so a
+#   mostly-right read isn't shown as a pile of "errors". They are still listed
+#   (amber) and still lower the weighted score via their per_word_score.
+# INCLUDE_MINOR_IN_PRACTICE: if True, minor words also feed the Practice
+#   Mistakes list and the Focus Script. Imported by practice_mistakes.py so
+#   both places always agree.
+MINOR_COUNTS_AS_CORRECT = True
+INCLUDE_MINOR_IN_PRACTICE = False
 
 
 def run_pipeline(raw_audio_path: str, reference_script: str) -> dict:
@@ -107,8 +117,16 @@ def run_pipeline(raw_audio_path: str, reference_script: str) -> dict:
         return _error_response("Error detection failed")
     t = _lap('detect_errors', t)
 
-    error_count = len([e for e in errors if e["type"] not in ("correct", "inserted")])
-    logger.info(f'Detected {error_count} errors out of {len(errors)} words')
+    # Log honest counts: the old line counted every non-'correct' word
+    # (minor slips, forgiven accent variants, ...) as an "error".
+    _types = [e['type'] for e in errors if e['type'] != 'inserted']
+    minor_n = _types.count('minor')
+    accent_n = _types.count('accent')
+    hard_n = len([x for x in _types if x not in ('correct', 'minor', 'accent')])
+    logger.info(
+        f'Detected {hard_n} errors, {minor_n} minor, {accent_n} accent '
+        f'out of {len(_types)} words'
+    )
 
     # ── Stage 6: Score and grade ──
     try:
@@ -133,7 +151,8 @@ def run_pipeline(raw_audio_path: str, reference_script: str) -> dict:
     # These MUST be derived from the same `errors` list the scorer consumed,
     # never recomputed independently — that divergence was the original bug.
     scoreable = [e for e in errors if e['type'] != 'inserted']
-    correct_count = len([e for e in scoreable if e['type'] in ('correct', 'accent')])
+    passing_types = ('correct', 'accent') + (('minor',) if MINOR_COUNTS_AS_CORRECT else ())
+    correct_count = len([e for e in scoreable if e['type'] in passing_types])
     total_scoreable = len(scoreable)
     wrong_count = total_scoreable - correct_count
     word_accuracy = round((correct_count / total_scoreable) * 100, 1) if total_scoreable else 0.0
@@ -220,9 +239,10 @@ def _build_feedback(errors: list) -> tuple:
     # in parallel, and time-bounded (see feedback.get_feedback_audio_batch).
     # Previously this happened one word at a time inside the loop below,
     # which dominated /api/analyze/ latency on sessions with many errors.
+    # 'accent' words are forgiven, so they get no TTS "correction" audio.
     words_needing_audio = [
         e['word'] for e in errors
-        if e['type'] not in ('correct', 'inserted') and e.get('word')
+        if e['type'] not in ('correct', 'inserted', 'accent') and e.get('word')
     ]
     try:
         audio_map = get_feedback_audio_batch(words_needing_audio)
@@ -254,21 +274,30 @@ def _build_feedback(errors: list) -> tuple:
                 word_entry['explanation'] = explanation
                 word_entry['audio_path'] = audio_path
 
-                feedback.append({
-                    'word': e['word'],
-                    'type': e['type'],
-                    'per_word_score': e.get('per_word_score', 0.0),
-                    'severity': e.get('severity', 0),
-                    'explanation': explanation,
-                    'audio_path': audio_path,
-                    'ref_phonemes': ref_display,
-                    'pred_phonemes': pred_display
-                })
+                # Forgiven accent variants keep their explanation (shown when
+                # the word is tapped) but are NOT correction feedback, so they
+                # stay out of the feedback list that Flutter's red warning
+                # banner reads from.
+                if e['type'] != 'accent':
+                    feedback.append({
+                        'word': e['word'],
+                        'type': e['type'],
+                        'per_word_score': e.get('per_word_score', 0.0),
+                        'severity': e.get('severity', 0),
+                        'explanation': explanation,
+                        'audio_path': audio_path,
+                        'ref_phonemes': ref_display,
+                        'pred_phonemes': pred_display
+                    })
             except Exception as ex:
                 logger.warning(f"Feedback generation failed for '{e['word']}': {ex}")
                 word_entry['explanation'] = f"Error generating feedback: {str(ex)}"
 
         words_output.append(word_entry)
+
+    # Worst first: Flutter shows feedback[0] in its banner, which used to be
+    # simply the first flagged word in reading order (often a trivial slip).
+    feedback.sort(key=lambda f: -(f.get('severity') or 0))
 
     return words_output, feedback
 
@@ -276,10 +305,12 @@ def _build_feedback(errors: list) -> tuple:
 
 def _build_mistake_summary(errors: list) -> dict:
     """Build mistake summary for Practice Mistakes button."""
+    excluded = ('correct', 'inserted', 'accent') + (() if INCLUDE_MINOR_IN_PRACTICE else ('minor',))
+
     mistakes = []
     for e in errors:
         err_type = e.get('type', '')
-        if err_type in ('correct', 'inserted', 'accent'):
+        if err_type in excluded:
             continue
 
         mistakes.append({
