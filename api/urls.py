@@ -41,6 +41,8 @@ from .views import (
 )
 # Focus Script before/after flow lives in its own module
 from .focus_views import FocusScriptDetailView, CompleteFocusScriptView
+# Stat-card drill-downs + single-session detail
+from .stats_views import StatDetailView, SessionDetailView
 
 urlpatterns = [
     # Auth
@@ -57,6 +59,10 @@ urlpatterns = [
 
     # Session History
     path('sessions/', SessionHistoryView.as_view(), name='session_history'),
+    path('sessions/<int:session_id>/', SessionDetailView.as_view(), name='session_detail'),
+
+    # Stat-card drill-downs (metric = sessions|accuracy|words|streak|errors)
+    path('stats/<str:metric>/', StatDetailView.as_view(), name='stat_detail'),
 
     # User Profile
     path('profile/', ProfileView.as_view(), name='profile'),
