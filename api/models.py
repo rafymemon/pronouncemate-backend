@@ -259,3 +259,38 @@ class Notification(models.Model):
 
     def __str__(self):
         return f'{self.user.username}: {self.title} ({"read" if self.is_read else "unread"})'
+
+
+class EmailOTP(models.Model):
+    """
+    One-time codes sent by email, for two purposes:
+      - verify_email   : activates a newly registered account
+      - reset_password : proves ownership of the email before a password reset
+
+    Only an HMAC of the code is stored, never the code itself. For
+    reset_password, a successful code check issues a short-lived reset
+    token (also stored hashed) that the final "set new password" call needs.
+    """
+    PURPOSE_VERIFY = 'verify_email'
+    PURPOSE_RESET  = 'reset_password'
+    PURPOSE_CHOICES = [
+        (PURPOSE_VERIFY, 'Verify email'),
+        (PURPOSE_RESET,  'Reset password'),
+    ]
+
+    user             = models.ForeignKey(User, on_delete=models.CASCADE, related_name='email_otps')
+    purpose          = models.CharField(max_length=20, choices=PURPOSE_CHOICES)
+    code_hash        = models.CharField(max_length=64)
+    reset_token_hash = models.CharField(max_length=64, blank=True)
+    attempts         = models.PositiveSmallIntegerField(default=0)
+    is_used          = models.BooleanField(default=False)
+    verified_at      = models.DateTimeField(null=True, blank=True)
+    created_at       = models.DateTimeField(auto_now_add=True)
+    expires_at       = models.DateTimeField()
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [models.Index(fields=['user', 'purpose', '-created_at'])]
+
+    def __str__(self):
+        return f'{self.user.username}: {self.purpose} ({"used" if self.is_used else "open"})'

@@ -3,14 +3,18 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()  # Load variables from .env file
-
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+load_dotenv(BASE_DIR / '.env')  # Load variables from .env (project root, next to manage.py)
 
 # ── Security ───────────────────────────────────────────────────
 SECRET_KEY = os.getenv('SECRET_KEY', 'fallback-insecure-key')
 DEBUG = os.getenv('DEBUG', 'True') == 'True'
 ALLOWED_HOSTS = ['*']
+
+# OTP hashes are keyed with SECRET_KEY, so never run production on the fallback.
+if not DEBUG and SECRET_KEY == 'fallback-insecure-key':
+    raise RuntimeError('Set SECRET_KEY in the environment when DEBUG is False.')
 
 # ── Installed Apps ─────────────────────────────────────────────
 
@@ -81,6 +85,14 @@ REST_FRAMEWORK = {
     'DEFAULT_RENDERER_CLASSES': [
         'rest_framework.renderers.JSONRenderer',
     ],
+    # Only views that set throttle_scope (the auth endpoints) are throttled.
+    # Limits are per client IP for anonymous requests.
+    'DEFAULT_THROTTLE_RATES': {
+        'auth_login':    '10/min',
+        'auth_register': '20/hour',
+        'auth_otp':      '15/min',
+        'auth_email':    '20/hour',
+    },
 }
 
 # ── CORS (allows Flutter app to call this API) ──────────────────
@@ -90,6 +102,36 @@ CORS_ALLOWED_ORIGINS = [
     'http://10.0.2.2:8000',  # Android emulator -> host machine
 ]
 CORS_ALLOW_ALL_ORIGINS = DEBUG  # Allow all origins in development
+
+# ── Email (OTP codes) ───────────────────────────────────────────
+# Put these two lines in .env to send REAL emails (Gmail App Password):
+#   EMAIL_HOST_USER=yourgmail@gmail.com
+#   EMAIL_HOST_PASSWORD=<16-character Google App Password>
+# Without them, emails are only PRINTED in the server terminal.
+EMAIL_HOST          = os.getenv('EMAIL_HOST', 'smtp.gmail.com')
+EMAIL_PORT          = int(os.getenv('EMAIL_PORT', '587'))
+EMAIL_USE_TLS       = os.getenv('EMAIL_USE_TLS', 'True') == 'True'
+EMAIL_HOST_USER     = os.getenv('EMAIL_HOST_USER', '').strip()
+EMAIL_HOST_PASSWORD = os.getenv('EMAIL_HOST_PASSWORD', '').replace(' ', '')  # Google shows it with spaces
+EMAIL_TIMEOUT       = 15
+DEFAULT_FROM_EMAIL  = os.getenv(
+    'DEFAULT_FROM_EMAIL',
+    f'PronounceMate <{EMAIL_HOST_USER}>' if EMAIL_HOST_USER
+    else 'PronounceMate <noreply@pronouncemate.local>',
+)
+
+_smtp_ready = bool(EMAIL_HOST_USER and EMAIL_HOST_PASSWORD)
+EMAIL_BACKEND = os.getenv('EMAIL_BACKEND') or (
+    'django.core.mail.backends.smtp.EmailBackend' if _smtp_ready
+    else 'django.core.mail.backends.console.EmailBackend'
+)
+
+# Say clearly, at every startup, how OTP emails will be delivered.
+if EMAIL_BACKEND.endswith('console.EmailBackend'):
+    print('⚠️  EMAIL: console mode - OTP emails are only PRINTED in this terminal, '
+          'NOT sent. Set EMAIL_HOST_USER and EMAIL_HOST_PASSWORD in .env.')
+else:
+    print(f'📧 EMAIL: sending via {EMAIL_HOST}:{EMAIL_PORT} as {EMAIL_HOST_USER or "(no user)"}')
 
 # ── Media Files (gTTS audio, uploaded WAV files) ────────────────
 MEDIA_ROOT = BASE_DIR / os.getenv('MEDIA_ROOT', 'media')
@@ -102,7 +144,10 @@ STATIC_ROOT = BASE_DIR / 'staticfiles'
 # ── Password Validation ─────────────────────────────────────────
 AUTH_PASSWORD_VALIDATORS = [
     {'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator'},
-    {'NAME': 'django.contrib.auth.password_validation.MinimumLengthValidator'},
+    {'NAME': 'django.contrib.auth.password_validation.MinimumLengthValidator',
+     'OPTIONS': {'min_length': 8}},
+    {'NAME': 'django.contrib.auth.password_validation.CommonPasswordValidator'},
+    {'NAME': 'django.contrib.auth.password_validation.NumericPasswordValidator'},
 ]
 
 # ── Localisation ────────────────────────────────────────────────

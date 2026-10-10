@@ -9,16 +9,6 @@ from .models import (
 from .focus_results import compute_baseline
 
 
-class RegisterSerializer(serializers.ModelSerializer):
-    password = serializers.CharField(write_only=True, min_length=8)
-    class Meta:
-        model = User
-        fields = ['username', 'email', 'password', 'first_name', 'last_name']
-    
-    def create(self, validated_data):
-        user = User.objects.create_user(**validated_data)
-        UserProfile.objects.create(user=user)
-        return user
 
 class SessionSerializer(serializers.ModelSerializer):
     class Meta:

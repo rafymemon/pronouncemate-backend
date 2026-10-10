@@ -6,18 +6,14 @@ Includes main pronunciation + Practice Mistakes endpoints
 
 from django.urls import path
 from .views import (
-    # Auth
-    RegisterView,
-    LoginView,
     # Core
     AnalyzeView,
     # Practice Mistakes
     PracticeScriptView,
     PracticeMistakesView,
     PracticeProgressView,
-    # History & Profile
+    # History
     SessionHistoryView,
-    ProfileView,
     # Scripts
     ScriptListView,
     ScriptUploadView,
@@ -39,6 +35,24 @@ from .views import (
     MarkNotificationsReadView,
     NotificationDeleteView,
 )
+# Authentication (register / email verification / login / password reset)
+from .auth_views import (
+    RegisterView,
+    VerifyEmailView,
+    ResendVerificationView,
+    LoginView,
+    LogoutView,
+    ForgotPasswordView,
+    VerifyResetOTPView,
+    ResetPasswordView,
+)
+# Signed-in account management (profile, change password, change email)
+from .account_views import (
+    ProfileView,
+    ChangePasswordView,
+    EmailChangeRequestView,
+    EmailChangeConfirmView,
+)
 # Focus Script before/after flow lives in its own module
 from .focus_views import FocusScriptDetailView, CompleteFocusScriptView
 # Stat-card drill-downs + single-session detail
@@ -47,7 +61,16 @@ from .stats_views import StatDetailView, SessionDetailView
 urlpatterns = [
     # Auth
     path('register/', RegisterView.as_view(), name='register'),
+    path('verify-email/', VerifyEmailView.as_view(), name='verify-email'),
+    path('resend-verification/', ResendVerificationView.as_view(), name='resend-verification'),
     path('login/', LoginView.as_view(), name='login'),
+    path('logout/', LogoutView.as_view(), name='logout'),
+    path('forgot-password/', ForgotPasswordView.as_view(), name='forgot-password'),
+    path('verify-reset-otp/', VerifyResetOTPView.as_view(), name='verify-reset-otp'),
+    path('reset-password/', ResetPasswordView.as_view(), name='reset-password'),
+    path('change-password/', ChangePasswordView.as_view(), name='change-password'),
+    path('email-change/request/', EmailChangeRequestView.as_view(), name='email-change-request'),
+    path('email-change/confirm/', EmailChangeConfirmView.as_view(), name='email-change-confirm'),
 
     # Core Analysis
     path('analyze/', AnalyzeView.as_view(), name='analyze'),
@@ -64,7 +87,7 @@ urlpatterns = [
     # Stat-card drill-downs (metric = sessions|accuracy|words|streak|errors)
     path('stats/<str:metric>/', StatDetailView.as_view(), name='stat_detail'),
 
-    # User Profile
+    # User Profile (email is read-only here; see email-change/ above)
     path('profile/', ProfileView.as_view(), name='profile'),
 
     # Scripts

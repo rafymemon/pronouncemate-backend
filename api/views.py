@@ -5,16 +5,13 @@ from rest_framework.response   import Response
 from rest_framework.parsers    import MultiPartParser, JSONParser
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated, AllowAny
-from rest_framework.authtoken.models import Token
-from django.contrib.auth import authenticate
 from django.conf import settings
 from .models import PracticeSession, PhonemeError, UserProfile, Script, LEVEL_CHOICES, Notification
 from .serializers import (
-    RegisterSerializer, SessionSerializer, UserProfileSerializer,
+    SessionSerializer, UserProfileSerializer,
     ScriptSerializer, NotificationSerializer,
 )
 from Pipeline.pipeline import run_pipeline
-from django.contrib.auth.models import User
 
 from django.db.models import Avg, Count, Max, F, Sum, Value
 from django.db.models.functions import Coalesce
@@ -59,30 +56,9 @@ from Pipeline.practice_mistakes import (
 
 logger = logging.getLogger(__name__)
 
-# ═══════════════════════════════════════════════════════════════
-# AUTH VIEWS
-# ═══════════════════════════════════════════════════════════════
-
-class RegisterView(APIView):
-    permission_classes = [AllowAny]
-    def post(self, request):
-        s = RegisterSerializer(data=request.data)
-        if s.is_valid():
-            user  = s.save()
-            token, _ = Token.objects.get_or_create(user=user)
-            return Response({'token': token.key, 'username': user.username}, status=201)
-        return Response(s.errors, status=400)
-
-class LoginView(APIView):
-    permission_classes = [AllowAny]
-    def post(self, request):
-        username = request.data.get('username')
-        password = request.data.get('password')
-        user = authenticate(username=username, password=password)
-        if user:
-            token, _ = Token.objects.get_or_create(user=user)
-            return Response({'token': token.key, 'username': user.username})
-        return Response({'error': 'Invalid credentials'}, status=401)
+# NOTE: Authentication (register / verify email / login / logout / forgot &
+# reset password) lives in api/auth_views.py. Change password, change email
+# and the profile PATCH guard live in api/account_views.py.
 
 # ═══════════════════════════════════════════════════════════════
 # CORE ANALYSIS ENDPOINT (Enhanced with Practice Mistakes + Audio)
@@ -439,6 +415,13 @@ class SessionHistoryView(APIView):
 
 
 class ProfileView(APIView):
+    """
+    Profile read / update / clear-history.
+
+    The account email is NOT changed here: it requires a verification code,
+    see EmailChangeRequestView / EmailChangeConfirmView in api/account_views.py
+    (whose ProfileView subclass is the one routed in urls.py).
+    """
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
@@ -533,12 +516,6 @@ class ProfileView(APIView):
                 return Response({'error': 'Invalid level'}, status=400)
             profile.proficiency_level = level
             profile.save(update_fields=['proficiency_level'])
-        if 'email' in data:
-            email = data['email'].strip()
-            if User.objects.exclude(id=user.id).filter(email=email).exists():
-                return Response({'error': 'Email already in use'}, status=400)
-            user.email = email
-            user.save(update_fields=['email'])
 
         if 'voice_feedback' in data:
             value = data['voice_feedback']

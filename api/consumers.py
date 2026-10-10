@@ -3,10 +3,14 @@
 import json
 import logging
 import time
+from urllib.parse import parse_qs
+
 import numpy as np
 from Levenshtein import ratio as _lev_ratio
 from channels.generic.websocket import AsyncWebsocketConsumer
+from channels.db import database_sync_to_async
 from asgiref.sync import sync_to_async
+from rest_framework.authtoken.models import Token
 
 from Pipeline.whisper_asr import transcribe_live
 
@@ -17,6 +21,9 @@ SILENCE_CHUNKS_TO_CLOSE_WORD = 2
 MIN_VOICED_BYTES = 3200
 LOOKAHEAD = 3
 LOOKBACK = 2   # how far back a late/repeated word may still "heal" an earlier guess
+
+# Reject absurd scripts so a client cannot make the server hold huge state.
+MAX_SCRIPT_WORDS = 2000
 
 # Force-close a segment even without silence once the buffer holds this
 # much audio, so continuous fluent speech still gets periodic live
@@ -43,6 +50,17 @@ _WEAK_WORDS = frozenset({
     'in', 'on', 'is', 'it', 'its', 'i', 'my', 'me', 'we', 'he', 'she', 'you',
     'us', 'be', 'was', 'are', 'that', 'with', 'than', 'so', 'if', 'do', 'am',
 })
+
+
+@database_sync_to_async
+def _user_for_token(key: str):
+    """Returns the active User that owns this DRF auth token, or None."""
+    try:
+        return Token.objects.select_related('user').get(
+            key=key, user__is_active=True
+        ).user
+    except Token.DoesNotExist:
+        return None
 
 
 def _pcm16_to_float32(pcm_bytes: bytes) -> np.ndarray:
@@ -79,6 +97,18 @@ def _words_match(heard: str, expected: str) -> bool:
 
 class PracticeConsumer(AsyncWebsocketConsumer):
     async def connect(self):
+        # ── Authentication ───────────────────────────────────────
+        # The Flutter client connects to  ws://host/ws/...?token=<auth token>
+        # Closing BEFORE accept() makes the handshake fail with HTTP 403.
+        query = parse_qs(self.scope.get('query_string', b'').decode())
+        token_key = (query.get('token') or [''])[0].strip()
+        user = await _user_for_token(token_key) if token_key else None
+        if user is None:
+            print("🎤 [WS] Rejected connection: missing or invalid token")
+            await self.close(code=4401)
+            return
+
+        self.user = user
         await self.accept()
         self.expected_words = []
         self.word_index = 0
@@ -87,7 +117,7 @@ class PracticeConsumer(AsyncWebsocketConsumer):
         self.initialized = False
         self._chunk_count = 0
         self.statuses = {}
-        print("🎤 [WS] Client connected")
+        print(f"🎤 [WS] Client connected: {user.username}")
 
     async def disconnect(self, close_code):
         print(f"🎤 [WS] Client disconnected: {close_code}")
@@ -109,7 +139,17 @@ class PracticeConsumer(AsyncWebsocketConsumer):
 
         if data.get('type') == 'init':
             script_text = data.get('script_text', '')
-            self.expected_words = script_text.split()
+            if not isinstance(script_text, str):
+                return
+            words = script_text.split()
+            if len(words) > MAX_SCRIPT_WORDS:
+                await self.send(text_data=json.dumps({
+                    'type': 'error',
+                    'message': f'Script is too long (max {MAX_SCRIPT_WORDS} words).',
+                }))
+                return
+
+            self.expected_words = words
             self.word_index = 0
             self.voice_buffer = bytearray()
             self.silence_streak = 0
