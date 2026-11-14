@@ -1,0 +1,17 @@
+{
+  "split": "test",
+  "n_utterances": 100,
+  "n_evaluated": 99,
+  "n_word_pairs": 642,
+  "n_failed": 1,
+  "utterance_pcc": 0.6052219390186732,
+  "word_pcc": 0.24912668630815346,
+  "mean_pipeline_score": 59.97777777777778,
+  "mean_human_score": 76.86868686868686,
+  "failures": [
+    [
+      "015010033",
+      "No speech detected. Please try again."
+    ]
+  ]
+}

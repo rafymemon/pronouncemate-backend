@@ -130,7 +130,8 @@ def transcribe(audio_array: np.ndarray, sr: int = 16000,
                model: WhisperModel | None = None,
                min_segment_logprob: float = -1.0,
                hotwords: list | None = None,
-               log_drops: bool = False) -> list:
+               log_drops: bool = False,
+               vad_filter: bool = True) -> list:
     """
     Returns list of {word, start, end, prob} dicts.
     audio_array: float32 numpy array at 16kHz
@@ -144,6 +145,17 @@ def transcribe(audio_array: np.ndarray, sr: int = 16000,
     this are discarded whole (default -1.0 = previous behaviour).
     `hotwords`: optional list of names/acronyms to bias recognition toward.
     `log_drops`: print each word/segment that gets filtered out and why.
+
+    `vad_filter`: faster-whisper's own internal Silero VAD, run BEFORE
+    decoding, independent of any trimming audio_processor.py already did.
+    It carries the same "there's a silence gap before speech" assumption
+    as audio_processor.preprocess_audio's Step 2/Step 3 — on corpora with
+    no real lead-in silence (e.g. SpeechOcean762), it may be misjudging
+    where speech actually starts and swallowing part of the first word.
+    HYPOTHESIS, being tested via transcribe_for_analysis's own
+    `vad_filter` passthrough — not yet confirmed. Default True = original
+    behaviour, so every existing caller is unaffected unless it opts in
+    to vad_filter=False.
     """
     if model is None:
         model = get_analyze_model()
@@ -155,7 +167,7 @@ def transcribe(audio_array: np.ndarray, sr: int = 16000,
         word_timestamps=True,
         condition_on_previous_text=True,
         temperature=0.0,
-        vad_filter=True,
+        vad_filter=vad_filter,
         vad_parameters=dict(min_silence_duration_ms=500),
     )
     if hotwords:
@@ -252,12 +264,20 @@ def transcribe(audio_array: np.ndarray, sr: int = 16000,
 
 
 def transcribe_for_analysis(audio_array: np.ndarray, sr: int = 16000,
-                            reference_script: str | None = None) -> list:
+                            reference_script: str | None = None,
+                            vad_filter: bool = True) -> list:
     """
     Transcription for the final /api/analyze/ pass: analyze model, lower
     confidence thresholds (see ANALYZE_* constants), names/acronyms from the
     reference script passed as hotwords, and every dropped word/segment
     logged so a "skipped" word can be traced to its cause.
+
+    `vad_filter`: passthrough to transcribe()'s own vad_filter — see its
+    docstring. pipeline.run_pipeline sets this to `not skip_denoise`, so
+    benchmark-corpus runs (skip_denoise=True) also get Whisper's internal
+    VAD disabled, since both flags are testing the same "no real lead-in
+    silence" condition. Live app calls (skip_denoise=False, the default)
+    are completely unaffected — vad_filter stays True there.
     """
     hotwords = extract_hotwords(reference_script) if reference_script else None
     if hotwords:
@@ -271,6 +291,7 @@ def transcribe_for_analysis(audio_array: np.ndarray, sr: int = 16000,
         min_segment_logprob=ANALYZE_MIN_SEGMENT_LOGPROB,
         hotwords=hotwords,
         log_drops=True,
+        vad_filter=vad_filter,
     )
 
 

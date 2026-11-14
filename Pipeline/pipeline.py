@@ -29,13 +29,23 @@ MINOR_COUNTS_AS_CORRECT = True
 INCLUDE_MINOR_IN_PRACTICE = False
 
 
-def run_pipeline(raw_audio_path: str, reference_script: str) -> dict:
+def run_pipeline(raw_audio_path: str, reference_script: str, skip_denoise: bool = False) -> dict:
     """
     Full pipeline: audio -> transcript -> alignment -> errors -> score -> feedback.
 
     Args:
         raw_audio_path: path to WAV file from Flutter upload
         reference_script: the script the user was asked to read
+        skip_denoise: forwarded to preprocess_audio(), and ALSO now flips
+            Whisper's own internal VAD off (vad_filter=False) via
+            transcribe_for_analysis(). Both audio_processor.preprocess_audio's
+            noise-reduction step and faster-whisper's own Silero VAD assume
+            there's a real silence gap before speech starts; set True for
+            audio where that can't be guaranteed (e.g. benchmark corpora
+            like SpeechOcean762) — see preprocess_audio's docstring for the
+            noise-reduction half of this, and whisper_asr.transcribe's
+            docstring for the VAD half. Leave False (default) for live app
+            recordings, where both assumptions hold and both stay on.
 
     Returns:
         dict with score, grade, transcript, words list, feedback list, mistake_summary
@@ -52,7 +62,7 @@ def run_pipeline(raw_audio_path: str, reference_script: str) -> dict:
     # ── Stage 1: Preprocess audio ──
     t = time.perf_counter()
     try:
-        audio = preprocess_audio(raw_audio_path)
+        audio = preprocess_audio(raw_audio_path, skip_denoise=skip_denoise)
     except Exception as e:
         logger.error(f"Audio preprocessing failed: {e}")
         return _error_response("Audio preprocessing failed")
@@ -68,7 +78,14 @@ def run_pipeline(raw_audio_path: str, reference_script: str) -> dict:
 
     # ── Stage 2: Transcribe with timestamps ──
     try:
-        transcript = transcribe_for_analysis(audio, reference_script=reference_script)
+        # vad_filter=not skip_denoise: DIAGNOSTIC — testing whether Whisper's
+        # own internal VAD is independently eating first-word onsets on
+        # corpora with no real lead-in silence, the same assumption
+        # preprocess_audio's skip_denoise flag already addresses for noise
+        # reduction. Live app calls (skip_denoise=False) are unaffected.
+        transcript = transcribe_for_analysis(
+            audio, reference_script=reference_script, vad_filter=not skip_denoise
+        )
     except Exception as e:
         logger.error(f"Transcription failed: {e}")
         return _error_response("Transcription failed. Please try again with clearer audio.")
@@ -347,11 +364,6 @@ def _build_mistake_summary(errors: list) -> dict:
         'top_mistakes': mistakes[:3],
         'all_mistakes': mistakes
     }
-
-
-
-
-
 
 
 def _error_response(message: str) -> dict:
